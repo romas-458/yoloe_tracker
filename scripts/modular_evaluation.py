@@ -35,15 +35,23 @@ class VideoResult:
     video_name: str
     status: str  # 'success', 'failed', 'skipped'
     num_frames: int
+    dataset: str = "lasot"  # 'lasot' or 'got10k'
+    # LaSOT metrics
     auc: float = 0.0
     precision_20: float = 0.0
     normalized_precision: float = 0.0  # Pnorm - нормалізована precision
     avg_iou: float = 0.0
     median_iou: float = 0.0
     success_0_5: float = 0.0
+    # GOT-10k metrics
+    ao: float = 0.0  # Average Overlap
+    sr_50: float = 0.0  # Success Rate @ 0.5
+    sr_75: float = 0.0  # Success Rate @ 0.75
+    # Common
     tracking_rate: float = 0.0
     processing_time: float = 0.0
     fps: float = 0.0
+    repetitions: int = 1  # GOT-10k uses 3 repetitions
     model_path: str = ""  # Шлях до моделі (якщо використовується)
     error_message: str = ""
 
@@ -55,18 +63,23 @@ class ModularEvaluator:
     """Модульний evaluator для різних трекерів"""
 
     def __init__(self, tracker_name: str, tracker_params: Dict,
-                 output_dir: Path, resume: bool = False):
+                 output_dir: Path, dataset: str = 'lasot', resume: bool = False):
         """
         Args:
             tracker_name: Назва трекера з registry
             tracker_params: Параметри для трекера
             output_dir: Папка для результатів
+            dataset: Датасет ('lasot' or 'got10k')
             resume: Продовжити з останньої точки
         """
         self.tracker_name = tracker_name
         self.tracker_params = tracker_params
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.dataset = dataset.lower()
+
+        if self.dataset not in ['lasot', 'got10k']:
+            raise ValueError(f"Unknown dataset: {dataset}. Available: 'lasot', 'got10k'")
 
         # Перевірка доступності трекера
         available = TrackerRegistry.list_trackers()
@@ -125,8 +138,19 @@ class ModularEvaluator:
     def find_sequences(self, data_dir: Path,
                       class_filter: Optional[str] = None,
                       video_filter: Optional[str] = None,
-                      test_list: Optional[set] = None) -> List[tuple]:
+                      test_list: Optional[set] = None,
+                      subset: str = 'val') -> List[tuple]:
         """Знайти всі послідовності"""
+        if self.dataset == 'got10k':
+            return self.find_got10k_sequences(data_dir, video_filter, test_list, subset)
+        else:  # lasot
+            return self.find_lasot_sequences(data_dir, class_filter, video_filter, test_list)
+
+    def find_lasot_sequences(self, data_dir: Path,
+                            class_filter: Optional[str] = None,
+                            video_filter: Optional[str] = None,
+                            test_list: Optional[set] = None) -> List[tuple]:
+        """Знайти послідовності LaSOT"""
         sequences = []
 
         for class_dir in sorted(data_dir.iterdir()):
@@ -159,6 +183,59 @@ class ModularEvaluator:
 
         return sequences
 
+    def find_got10k_sequences(self, data_dir: Path,
+                             seq_filter: Optional[str] = None,
+                             test_list: Optional[set] = None,
+                             subset: str = 'val') -> List[tuple]:
+        """
+        Знайти послідовності GOT-10k
+
+        Структура:
+        GOT-10k/
+        ├── val/
+        │   ├── GOT-10k_Val_000001/
+        │   │   ├── 00000001.jpg
+        │   │   └── groundtruth.txt
+        │   └── GOT-10k_Val_000002/
+        └── test/
+        """
+        sequences = []
+
+        # Перевірити чи data_dir вже містить subset (val/test)
+        subset_dir = data_dir / subset
+        if not subset_dir.exists():
+            # Можливо data_dir вже є subset папка
+            if data_dir.name == subset or data_dir.name in ['val', 'test']:
+                subset_dir = data_dir
+            else:
+                print(f"⚠️  Warning: subset '{subset}' not found in {data_dir}")
+                return sequences
+
+        for seq_dir in sorted(subset_dir.iterdir()):
+            if not seq_dir.is_dir():
+                continue
+
+            seq_name = seq_dir.name
+
+            # Фільтр за назвою послідовності
+            if seq_filter and seq_name != seq_filter:
+                continue
+
+            # Фільтр за test_list
+            if test_list is not None and seq_name not in test_list:
+                continue
+
+            gt_file = seq_dir / "groundtruth.txt"
+
+            # Перевірити наявність кадрів (будь-який jpg файл)
+            image_files = list(seq_dir.glob("*.jpg")) + list(seq_dir.glob("*.png"))
+
+            if gt_file.exists() and len(image_files) > 0:
+                # Для GOT-10k: class_name = subset, video_name = seq_name
+                sequences.append((subset, seq_name, seq_dir))
+
+        return sequences
+
     def load_groundtruth(self, gt_file: Path) -> List[Optional[List[float]]]:
         """Завантажити groundtruth"""
         bboxes = []
@@ -186,18 +263,20 @@ class ModularEvaluator:
         video_path: Path,
         num_frames: int = 0,
         visualize: bool = False,
-        skip_if_exists: bool = True
+        skip_if_exists: bool = True,
+        repetitions: int = 1
     ) -> VideoResult:
         """
         Обробити одне відео
 
         Args:
-            class_name: Назва класу
+            class_name: Назва класу (для LaSOT) або subset (для GOT-10k)
             video_name: Назва відео
             video_path: Шлях до відео
             num_frames: Кількість кадрів (0 = всі)
             visualize: Зберігати візуалізацію
             skip_if_exists: Пропустити якщо вже оброблено
+            repetitions: Кількість повторів (GOT-10k використовує 3)
 
         Returns:
             VideoResult
@@ -215,11 +294,16 @@ class ModularEvaluator:
                 class_name=class_name,
                 video_name=video_name,
                 status='skipped',
-                num_frames=0
+                num_frames=0,
+                dataset=self.dataset
             )
 
-        # Шляхи
-        img_dir = video_path / "img"
+        # Шляхи (різні для LaSOT та GOT-10k)
+        if self.dataset == 'lasot':
+            img_dir = video_path / "img"
+        else:  # got10k
+            img_dir = video_path  # Кадри безпосередньо в папці відео
+
         gt_file = video_path / "groundtruth.txt"
 
         # Завантаження даних
@@ -241,54 +325,105 @@ class ModularEvaluator:
                 video_name=video_name,
                 status='failed',
                 num_frames=0,
+                dataset=self.dataset,
                 error_message="No images or invalid groundtruth"
             )
 
         print(f"\n{'='*70}")
         model_info = f" | Модель: {Path(self.tracker_params.get('model_path', '')).name}" if self.tracker_params.get('model_path') else ""
-        print(f"Трекер: {self.tracker_name}{model_info} | Відео: {class_name}/{video_name} ({len(image_files)} кадрів)")
+        dataset_info = f" | Dataset: {self.dataset.upper()}"
+        print(f"Трекер: {self.tracker_name}{model_info}{dataset_info} | Відео: {class_name}/{video_name} ({len(image_files)} кадрів)")
+        if repetitions > 1:
+            print(f"Repetitions: {repetitions}")
         print(f"{'='*70}")
 
         start_time = time.time()
 
         try:
-            # Створення трекера
-            tracker = TrackerRegistry.get_tracker(self.tracker_name, **self.tracker_params)
+            # GOT-10k: виконати repetitions
+            all_results = []
+            for rep in range(repetitions):
+                if repetitions > 1:
+                    print(f"\n  Repetition {rep + 1}/{repetitions}")
 
-            # Обробка
-            results = self._run_tracking(
-                tracker=tracker,
-                image_files=image_files,
-                groundtruth=groundtruth,
-                video_path=video_path,
-                visualize=visualize
-            )
+                # Створення трекера
+                tracker = TrackerRegistry.get_tracker(self.tracker_name, **self.tracker_params)
+
+                # Обробка
+                rep_results = self._run_tracking(
+                    tracker=tracker,
+                    image_files=image_files,
+                    groundtruth=groundtruth,
+                    video_path=video_path,
+                    visualize=visualize and (rep == 0)  # Візуалізувати тільки перший раз
+                )
+
+                all_results.append(rep_results)
 
             elapsed = time.time() - start_time
 
             # Обчислення метрик
-            metrics = self._compute_metrics(results, groundtruth)
+            if self.dataset == 'got10k':
+                # GOT-10k: усереднити метрики по всіх repetitions
+                all_metrics = [self._compute_got10k_metrics(results, groundtruth) for results in all_results]
 
-            result = VideoResult(
-                tracker_name=self.tracker_name,
-                class_name=class_name,
-                video_name=video_name,
-                status='success',
-                num_frames=len(image_files),
-                auc=metrics['auc'],
-                precision_20=metrics['precision_20'],
-                normalized_precision=metrics['normalized_precision'],
-                avg_iou=metrics['avg_iou'],
-                median_iou=metrics['median_iou'],
-                success_0_5=metrics['success_0.5'],
-                tracking_rate=metrics['tracking_rate'],
-                processing_time=elapsed,
-                fps=len(image_files) / elapsed if elapsed > 0 else 0,
-                model_path=self.tracker_params.get('model_path', '')
-            )
+                metrics = {
+                    'ao': np.mean([m['ao'] for m in all_metrics]),
+                    'sr_50': np.mean([m['sr_50'] for m in all_metrics]),
+                    'sr_75': np.mean([m['sr_75'] for m in all_metrics]),
+                    'avg_iou': np.mean([m['avg_iou'] for m in all_metrics]),
+                    'median_iou': np.median([m['median_iou'] for m in all_metrics]),
+                    'tracking_rate': np.mean([m['tracking_rate'] for m in all_metrics]),
+                }
 
-            print(f"✅ AUC={result.auc:.3f} P@20={result.precision_20:.3f} "
-                  f"Pnorm={result.normalized_precision:.3f} FPS={result.fps:.1f} ({elapsed:.1f}s)")
+                result = VideoResult(
+                    tracker_name=self.tracker_name,
+                    class_name=class_name,
+                    video_name=video_name,
+                    status='success',
+                    num_frames=len(image_files),
+                    dataset=self.dataset,
+                    ao=metrics['ao'],
+                    sr_50=metrics['sr_50'],
+                    sr_75=metrics['sr_75'],
+                    avg_iou=metrics['avg_iou'],
+                    median_iou=metrics['median_iou'],
+                    tracking_rate=metrics['tracking_rate'],
+                    processing_time=elapsed,
+                    fps=len(image_files) * repetitions / elapsed if elapsed > 0 else 0,
+                    repetitions=repetitions,
+                    model_path=self.tracker_params.get('model_path', '')
+                )
+
+                print(f"✅ AO={result.ao:.3f} SR0.5={result.sr_50:.3f} SR0.75={result.sr_75:.3f} "
+                      f"FPS={result.fps:.1f} ({elapsed:.1f}s)")
+
+            else:  # lasot
+                # LaSOT: одна repetition
+                results = all_results[0]
+                metrics = self._compute_metrics(results, groundtruth)
+
+                result = VideoResult(
+                    tracker_name=self.tracker_name,
+                    class_name=class_name,
+                    video_name=video_name,
+                    status='success',
+                    num_frames=len(image_files),
+                    dataset=self.dataset,
+                    auc=metrics['auc'],
+                    precision_20=metrics['precision_20'],
+                    normalized_precision=metrics['normalized_precision'],
+                    avg_iou=metrics['avg_iou'],
+                    median_iou=metrics['median_iou'],
+                    success_0_5=metrics['success_0.5'],
+                    tracking_rate=metrics['tracking_rate'],
+                    processing_time=elapsed,
+                    fps=len(image_files) / elapsed if elapsed > 0 else 0,
+                    model_path=self.tracker_params.get('model_path', '')
+                )
+
+                print(f"✅ AUC={result.auc:.3f} P@20={result.precision_20:.3f} "
+                      f"Pnorm={result.normalized_precision:.3f} FPS={result.fps:.1f} ({elapsed:.1f}s)")
 
         except Exception as e:
             elapsed = time.time() - start_time
@@ -298,6 +433,7 @@ class ModularEvaluator:
                 video_name=video_name,
                 status='failed',
                 num_frames=0,
+                dataset=self.dataset,
                 processing_time=elapsed,
                 model_path=self.tracker_params.get('model_path', ''),
                 error_message=str(e)
@@ -617,6 +753,40 @@ class ModularEvaluator:
 
         return inter_area / union_area if union_area > 0 else 0.0
 
+    def _compute_got10k_metrics(self, pred_bboxes: List, gt_bboxes: List) -> Dict:
+        """
+        Обчислити GOT-10k метрики: AO, SR0.5, SR0.75
+
+        GOT-10k метрики:
+        - AO (Average Overlap): середній IoU
+        - SR0.5: Success Rate @ IoU >= 0.5
+        - SR0.75: Success Rate @ IoU >= 0.75
+        """
+        ious = []
+
+        for pred, gt in zip(pred_bboxes, gt_bboxes):
+            if pred and gt:
+                iou = self._compute_iou(pred, gt)
+                ious.append(iou)
+            else:
+                ious.append(0.0)
+
+        ious = np.array(ious)
+
+        # GOT-10k metrics
+        metrics = {
+            'ao': float(np.mean(ious)),  # Average Overlap
+            'sr_50': float(np.mean(ious >= 0.5)),  # Success Rate @ 0.5
+            'sr_75': float(np.mean(ious >= 0.75)),  # Success Rate @ 0.75
+            'avg_iou': float(np.mean(ious)),  # Alias for AO
+            'median_iou': float(np.median(ious)),
+            'tracking_rate': sum(1 for p in pred_bboxes if p) / len(pred_bboxes),
+            # Success curve for GOT-10k (101 thresholds from 0 to 1)
+            'succ_curve': [float(np.mean(ious >= t)) for t in np.linspace(0, 1, 101)]
+        }
+
+        return metrics
+
     def compute_aggregated_metrics(self) -> Dict:
         """Агрегація метрик"""
         successful = [r for r in self.results if r.status == 'success']
@@ -636,28 +806,43 @@ class ModularEvaluator:
 
             per_class[class_name] = {
                 'num_videos': len(class_results),
-                'avg_auc': np.mean([r.auc for r in class_results]),
-                'avg_precision_20': np.mean([r.precision_20 for r in class_results]),
-                'avg_normalized_precision': np.mean([r.normalized_precision for r in class_results]),
                 'avg_iou': np.mean([r.avg_iou for r in class_results]),
                 'avg_fps': np.mean([r.fps for r in class_results]),
             }
 
+            # Dataset-specific metrics
+            if self.dataset == 'got10k':
+                per_class[class_name]['avg_ao'] = np.mean([r.ao for r in class_results])
+                per_class[class_name]['avg_sr_50'] = np.mean([r.sr_50 for r in class_results])
+                per_class[class_name]['avg_sr_75'] = np.mean([r.sr_75 for r in class_results])
+            else:  # lasot
+                per_class[class_name]['avg_auc'] = np.mean([r.auc for r in class_results])
+                per_class[class_name]['avg_precision_20'] = np.mean([r.precision_20 for r in class_results])
+                per_class[class_name]['avg_normalized_precision'] = np.mean([r.normalized_precision for r in class_results])
+
         # Overall
         overall = {
             'tracker': self.tracker_name,
+            'dataset': self.dataset,
             'model_path': self.tracker_params.get('model_path', ''),
             'num_videos': len(successful),
             'num_classes': len(classes),
-            'avg_auc': np.mean([r.auc for r in successful]),
-            'avg_precision_20': np.mean([r.precision_20 for r in successful]),
-            'avg_normalized_precision': np.mean([r.normalized_precision for r in successful]),
             'avg_iou': np.mean([r.avg_iou for r in successful]),
             'avg_fps': np.mean([r.fps for r in successful]),
             'total_frames': sum(r.num_frames for r in successful),
             'total_time': sum(r.processing_time for r in successful),
             'failed': len([r for r in self.results if r.status == 'failed']),
         }
+
+        # Dataset-specific metrics
+        if self.dataset == 'got10k':
+            overall['avg_ao'] = np.mean([r.ao for r in successful])
+            overall['avg_sr_50'] = np.mean([r.sr_50 for r in successful])
+            overall['avg_sr_75'] = np.mean([r.sr_75 for r in successful])
+        else:  # lasot
+            overall['avg_auc'] = np.mean([r.auc for r in successful])
+            overall['avg_precision_20'] = np.mean([r.precision_20 for r in successful])
+            overall['avg_normalized_precision'] = np.mean([r.normalized_precision for r in successful])
 
         return {
             'per_video': per_video,
@@ -686,16 +871,25 @@ class ModularEvaluator:
             print(f"\n📄 Результати: {self.results_file}")
             return
 
-        print(f"\n📊 Overall ({overall['num_videos']} відео):")
-        print(f"   AUC:           {overall['avg_auc']:.4f}")
-        print(f"   Precision@20:  {overall['avg_precision_20']:.4f}")
-        print(f"   Pnorm:         {overall['avg_normalized_precision']:.4f}")
-        print(f"   Avg IoU:       {overall['avg_iou']:.4f}")
-        print(f"   Avg FPS:       {overall['avg_fps']:.1f}")
+        print(f"\n📊 Overall ({overall['num_videos']} відео | Dataset: {self.dataset.upper()}):")
+        if self.dataset == 'got10k':
+            print(f"   AO (Avg Overlap):  {overall['avg_ao']:.4f}")
+            print(f"   SR@0.5:            {overall['avg_sr_50']:.4f}")
+            print(f"   SR@0.75:           {overall['avg_sr_75']:.4f}")
+        else:  # lasot
+            print(f"   AUC:               {overall['avg_auc']:.4f}")
+            print(f"   Precision@20:      {overall['avg_precision_20']:.4f}")
+            print(f"   Pnorm:             {overall['avg_normalized_precision']:.4f}")
+        print(f"   Avg IoU:           {overall['avg_iou']:.4f}")
+        print(f"   Avg FPS:           {overall['avg_fps']:.1f}")
 
         for class_name, metrics in sorted(summary['per_class'].items()):
-            print(f"\n   {class_name}: AUC={metrics['avg_auc']:.3f} "
-                  f"Pnorm={metrics['avg_normalized_precision']:.3f} FPS={metrics['avg_fps']:.1f}")
+            if self.dataset == 'got10k':
+                print(f"\n   {class_name}: AO={metrics['avg_ao']:.3f} "
+                      f"SR0.5={metrics['avg_sr_50']:.3f} SR0.75={metrics['avg_sr_75']:.3f} FPS={metrics['avg_fps']:.1f}")
+            else:  # lasot
+                print(f"\n   {class_name}: AUC={metrics['avg_auc']:.3f} "
+                      f"Pnorm={metrics['avg_normalized_precision']:.3f} FPS={metrics['avg_fps']:.1f}")
 
         print(f"\n📄 Результати: {self.results_file}")
         print(f"{'='*70}\n")
@@ -714,9 +908,15 @@ class ModularEvaluator:
         video_filter: Optional[str] = None,
         test_list_file: Optional[Path] = None,
         max_videos: Optional[int] = None,
-        visualize: bool = False
+        visualize: bool = False,
+        subset: str = 'val',
+        repetitions: int = None
     ):
         """Запуск batch evaluation"""
+        # Auto-detect repetitions for GOT-10k
+        if repetitions is None:
+            repetitions = 3 if self.dataset == 'got10k' else 1
+
         # Завантажити test list якщо заданий
         test_list = None
         if test_list_file:
@@ -730,7 +930,7 @@ class ModularEvaluator:
                 print(f"⚠️  Test list файл порожній: {test_list_file}")
                 return
 
-        sequences = self.find_sequences(data_dir, class_filter, video_filter, test_list)
+        sequences = self.find_sequences(data_dir, class_filter, video_filter, test_list, subset)
 
         if not sequences:
             print("❌ Послідовності не знайдено")
@@ -739,7 +939,9 @@ class ModularEvaluator:
         if max_videos:
             sequences = sequences[:max_videos]
 
-        print(f"\n📂 Знайдено {len(sequences)} послідовностей")
+        print(f"\n📂 Знайдено {len(sequences)} послідовностей (Dataset: {self.dataset.upper()})")
+        if self.dataset == 'got10k':
+            print(f"   Subset: {subset}, Repetitions: {repetitions}")
         model_info = f" (Модель: {Path(self.tracker_params.get('model_path', '')).name})" if self.tracker_params.get('model_path') else ""
         print(f"🎯 Трекер: {self.tracker_name}{model_info}")
 
@@ -750,7 +952,8 @@ class ModularEvaluator:
                 video_path=video_path,
                 num_frames=num_frames,
                 visualize=visualize,
-                skip_if_exists=True
+                skip_if_exists=True,
+                repetitions=repetitions
             )
 
             self.results.append(result)
@@ -773,17 +976,23 @@ def main():
   # Список доступних трекерів
   python modular_evaluation.py --list-trackers
 
-  # KCF трекер
-  python modular_evaluation.py -d data/ -o results/ --tracker KCF
+  # LaSOT - KCF трекер
+  python modular_evaluation.py -d data/LaSOT/ -o results/ --tracker KCF
 
-  # FastSAM-IoU трекер, 100 кадрів
-  python modular_evaluation.py -d data/ -o results/ --tracker FastSAM-IoU --num-frames 100
+  # LaSOT - FastSAM-IoU трекер, 100 кадрів
+  python modular_evaluation.py -d data/LaSOT/ -o results/ --tracker FastSAM-IoU --num-frames 100
 
-  # CSRT трекер, тільки airplane
-  python modular_evaluation.py -d data/ -o results/ --tracker CSRT --class airplane
+  # LaSOT - CSRT трекер, тільки airplane
+  python modular_evaluation.py -d data/LaSOT/ -o results/ --tracker CSRT --class airplane
 
-  # З візуалізацією
-  python modular_evaluation.py -d data/ -o results/ --tracker KCF --visualize
+  # GOT-10k - KCF на одному відео
+  python modular_evaluation.py -d data/GOT-10k/ -o results/ --tracker KCF --dataset got10k --video GOT-10k_Val_000001
+
+  # GOT-10k - YOLOe на перших 10 відео val
+  python modular_evaluation.py -d data/GOT-10k/ -o results/ --tracker YOLOe-VP-IoU --dataset got10k --first 10
+
+  # GOT-10k - CSRT з 1 repetition (для швидкого тесту)
+  python modular_evaluation.py -d data/GOT-10k/ -o results/ --tracker CSRT --dataset got10k --first 3 --repetitions 1
         """
     )
 
@@ -809,6 +1018,16 @@ def main():
                         help='Зберігати візуалізацію')
     parser.add_argument('--resume', action='store_true',
                         help='Продовжити')
+
+    # Dataset options
+    parser.add_argument('--dataset', type=str, default='lasot', choices=['lasot', 'got10k'],
+                        help='Dataset (lasot or got10k, default: lasot)')
+    parser.add_argument('--subset', type=str, default='val', choices=['val', 'test'],
+                        help='GOT-10k subset (val or test, default: val)')
+    parser.add_argument('--repetitions', type=int,
+                        help='Number of repetitions (GOT-10k default: 3, LaSOT default: 1)')
+    parser.add_argument('--first', type=int,
+                        help='Evaluate first N sequences (for quick testing)')
 
     # Параметри трекерів
     parser.add_argument('--tracker-params', type=str,
@@ -866,11 +1085,15 @@ def main():
         for key, value in tracker_params.items():
             print(f"   {key}: {value}")
 
+    # Handle --first parameter
+    max_videos = args.max_videos or args.first
+
     # Evaluator
     evaluator = ModularEvaluator(
         tracker_name=args.tracker,
         tracker_params=tracker_params,
         output_dir=Path(args.output),
+        dataset=args.dataset,
         resume=args.resume
     )
 
@@ -886,8 +1109,10 @@ def main():
         class_filter=args.class_filter,
         video_filter=args.video_filter,
         test_list_file=test_list_file,
-        max_videos=args.max_videos,
-        visualize=args.visualize
+        max_videos=max_videos,
+        visualize=args.visualize,
+        subset=args.subset,
+        repetitions=args.repetitions
     )
 
 
