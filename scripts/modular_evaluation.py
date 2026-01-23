@@ -37,6 +37,7 @@ class VideoResult:
     num_frames: int
     auc: float = 0.0
     precision_20: float = 0.0
+    normalized_precision: float = 0.0  # Pnorm - нормалізована precision
     avg_iou: float = 0.0
     median_iou: float = 0.0
     success_0_5: float = 0.0
@@ -276,6 +277,7 @@ class ModularEvaluator:
                 num_frames=len(image_files),
                 auc=metrics['auc'],
                 precision_20=metrics['precision_20'],
+                normalized_precision=metrics['normalized_precision'],
                 avg_iou=metrics['avg_iou'],
                 median_iou=metrics['median_iou'],
                 success_0_5=metrics['success_0.5'],
@@ -286,7 +288,7 @@ class ModularEvaluator:
             )
 
             print(f"✅ AUC={result.auc:.3f} P@20={result.precision_20:.3f} "
-                  f"FPS={result.fps:.1f} ({elapsed:.1f}s)")
+                  f"Pnorm={result.normalized_precision:.3f} FPS={result.fps:.1f} ({elapsed:.1f}s)")
 
         except Exception as e:
             elapsed = time.time() - start_time
@@ -548,6 +550,7 @@ class ModularEvaluator:
         """Обчислити метрики"""
         ious = []
         distances = []
+        norm_distances = []
 
         for pred, gt in zip(pred_bboxes, gt_bboxes):
             if pred and gt:
@@ -559,17 +562,30 @@ class ModularEvaluator:
                 gc = (gt[0] + gt[2]/2, gt[1] + gt[3]/2)
                 dist = np.sqrt((pc[0]-gc[0])**2 + (pc[1]-gc[1])**2)
                 distances.append(dist)
+
+                # Normalized center distance (нормалізований розміром об'єкта)
+                # Відповідає LaSOT normalized_center_error
+                norm_dist = np.sqrt(
+                    ((pc[0]-gc[0])/max(1.0, gt[2]))**2 +
+                    ((pc[1]-gc[1])/max(1.0, gt[3]))**2
+                )
+                norm_distances.append(norm_dist)
             else:
                 ious.append(0.0)
                 distances.append(float('inf'))
+                norm_distances.append(float('inf'))
 
         ious = np.array(ious)
         distances = np.array(distances)
+        norm_distances = np.array(norm_distances)
 
         # Metrics
         metrics = {
             'auc': float(np.mean([np.mean(ious >= t) for t in np.arange(0, 1.01, 0.01)])),
             'precision_20': float(np.mean(distances <= 20.0)),
+            'normalized_precision': float(np.mean([
+                np.mean(norm_distances <= t) for t in np.linspace(0, 0.5, 51)
+            ])),  # Pnorm - AUC normalized precision curve
             'avg_iou': float(np.mean(ious)),
             'median_iou': float(np.median(ious)),
             'success_0.5': float(np.mean(ious >= 0.5)),
@@ -622,6 +638,7 @@ class ModularEvaluator:
                 'num_videos': len(class_results),
                 'avg_auc': np.mean([r.auc for r in class_results]),
                 'avg_precision_20': np.mean([r.precision_20 for r in class_results]),
+                'avg_normalized_precision': np.mean([r.normalized_precision for r in class_results]),
                 'avg_iou': np.mean([r.avg_iou for r in class_results]),
                 'avg_fps': np.mean([r.fps for r in class_results]),
             }
@@ -634,6 +651,7 @@ class ModularEvaluator:
             'num_classes': len(classes),
             'avg_auc': np.mean([r.auc for r in successful]),
             'avg_precision_20': np.mean([r.precision_20 for r in successful]),
+            'avg_normalized_precision': np.mean([r.normalized_precision for r in successful]),
             'avg_iou': np.mean([r.avg_iou for r in successful]),
             'avg_fps': np.mean([r.fps for r in successful]),
             'total_frames': sum(r.num_frames for r in successful),
@@ -671,11 +689,13 @@ class ModularEvaluator:
         print(f"\n📊 Overall ({overall['num_videos']} відео):")
         print(f"   AUC:           {overall['avg_auc']:.4f}")
         print(f"   Precision@20:  {overall['avg_precision_20']:.4f}")
+        print(f"   Pnorm:         {overall['avg_normalized_precision']:.4f}")
         print(f"   Avg IoU:       {overall['avg_iou']:.4f}")
         print(f"   Avg FPS:       {overall['avg_fps']:.1f}")
 
         for class_name, metrics in sorted(summary['per_class'].items()):
-            print(f"\n   {class_name}: AUC={metrics['avg_auc']:.3f} FPS={metrics['avg_fps']:.1f}")
+            print(f"\n   {class_name}: AUC={metrics['avg_auc']:.3f} "
+                  f"Pnorm={metrics['avg_normalized_precision']:.3f} FPS={metrics['avg_fps']:.1f}")
 
         print(f"\n📄 Результати: {self.results_file}")
         print(f"{'='*70}\n")
