@@ -66,6 +66,11 @@ class YOLOeVPIoUTracker(BaseTracker):
         phase2_diou_threshold: float - мінімальний DIoU для Phase 2 matching (>=1.0 = disabled, default: 1.0)
             Дозволяє знаходити об'єкт на Phase 2 навіть якщо IoU=0 (bbox не перетинаються)
             Рекомендовані значення: -0.5 (помірне), -0.7 (м'яке), 0.0 (строге)
+        waiting_reinit_conf_threshold: float - мінімальна conf для дострокової реініціалізації у Phase 2 (>=1.0 = disabled, default: 1.0)
+            Якщо conf >= цього порогу та diou >= waiting_reinit_diou_threshold, то реініціалізація відбувається одразу
+        waiting_reinit_diou_threshold: float - мінімальний DIoU для дострокової реініціалізації у Phase 2 (default: -0.5)
+            Працює тільки якщо waiting_reinit_conf_threshold < 1.0
+            Рекомендовані значення: -0.5 (помірне), -0.3 (строге), -0.7 (м'яке)
         reinit_diou_threshold: float - початковий мінімальний DIoU для реідентифікації (-1.0 = без обмеження, default: -1.0)
             DIoU = IoU - (d²/c²), де d - відстань центрів, c - діагональ охоплюючого bbox
             Діапазон: від -1 (дуже далеко) до 1 (ідеальне співпадіння)
@@ -78,10 +83,13 @@ class YOLOeVPIoUTracker(BaseTracker):
 
     Трифазна логіка:
         Фаза 1 (IoU Matching): Strict matching з last_valid_bbox
-        Фаза 2 (DIoU Пошук): Якщо IoU < threshold, спробувати DIoU matching для швидкорухомих об'єктів
-            - Якщо phase2_diou_threshold <= -1.0: пошук за DIoU (дозволяє tracking без перетину bbox)
+        Фаза 2 (DIoU Пошук + Очікування): Якщо IoU < threshold
+            - Спробувати DIoU matching (якщо phase2_diou_threshold < 1.0)
+            - Спробувати дострокову реініціалізацію (якщо waiting_reinit_conf_threshold < 1.0)
+              - Якщо conf >= waiting_reinit_conf_threshold та diou >= waiting_reinit_diou_threshold
             - Інакше: режим очікування (grace period до max_lost_frames кадрів)
         Фаза 3 (Реідентифікація): Fallback до max(conf) detection з фільтрацією за DIoU
+            - Спочатку перевірити високоякісну детекцію (якщо reinit_conf_threshold < 1.0)
             - Якщо reinit_diou_threshold > -1.0: вибирається max(conf) серед кандидатів з DIoU >= threshold
             - Якщо reinit_diou_threshold = -1.0: вибирається max(conf) без обмежень (default)
 
@@ -105,6 +113,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                  vpe_conf_max: float = 0.5,
                  vpe_conf_adaptive_rate: int = 5,
                  phase2_diou_threshold: float = 1.0,
+                 waiting_reinit_conf_threshold: float = 1.0,
+                 waiting_reinit_diou_threshold: float = -0.5,
                  reinit_diou_threshold: float = -1.0,
                  reinit_diou_max: float = -0.9,
                  reinit_adaptive_rate: int = 15,
@@ -137,6 +147,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.vpe_conf_max = vpe_conf_max
         self.vpe_conf_adaptive_rate = vpe_conf_adaptive_rate
         self.phase2_diou_threshold = phase2_diou_threshold
+        self.waiting_reinit_conf_threshold = waiting_reinit_conf_threshold
+        self.waiting_reinit_diou_threshold = waiting_reinit_diou_threshold
         self.reinit_diou_threshold = reinit_diou_threshold
         self.reinit_diou_max = reinit_diou_max
         self.reinit_adaptive_rate = reinit_adaptive_rate
@@ -187,6 +199,12 @@ class YOLOeVPIoUTracker(BaseTracker):
             else:
                 phase2_msg = ""
 
+            # Waiting reinit info (Phase 2 early reinit)
+            if waiting_reinit_conf_threshold < 1.0:
+                waiting_reinit_msg = f", waiting_reinit(conf>={waiting_reinit_conf_threshold},diou>={waiting_reinit_diou_threshold})"
+            else:
+                waiting_reinit_msg = ""
+
             # DIoU adaptive info
             if reinit_diou_threshold > -1.0:
                 if reinit_diou_max < reinit_diou_threshold:
@@ -203,7 +221,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             else:
                 reinit_conf_msg = ""
 
-            print(f"✅ YOLOe-VP-IoU готовий (vpe_step={vpe_step}, max_vpe={max_vpe}, iou_threshold={iou_threshold}, max_lost_frames={max_lost_frames}{conf_msg}{vpe_conf_msg}{phase2_msg}{reinit_msg}{reinit_conf_msg})")
+            print(f"✅ YOLOe-VP-IoU готовий (vpe_step={vpe_step}, max_vpe={max_vpe}, iou_threshold={iou_threshold}, max_lost_frames={max_lost_frames}{conf_msg}{vpe_conf_msg}{phase2_msg}{waiting_reinit_msg}{reinit_msg}{reinit_conf_msg})")
 
     @classmethod
     def get_name(cls) -> str:
@@ -222,6 +240,8 @@ class YOLOeVPIoUTracker(BaseTracker):
             'max_lost_frames': 30,
             'vpe_conf_threshold': 0.5,
             'phase2_diou_threshold': 1.0,
+            'waiting_reinit_conf_threshold': 1.0,
+            'waiting_reinit_diou_threshold': -0.5,
             'reinit_diou_threshold': -1.0,
             'reinit_diou_max': -0.9,
             'reinit_adaptive_rate': 15,
@@ -267,7 +287,10 @@ class YOLOeVPIoUTracker(BaseTracker):
         Оновлення на новому кадрі з трифазною логікою
 
         Фаза 1: IoU Matching - порівняння з last_valid_bbox
-        Фаза 2: Пошук-Очікування - grace period до max_lost_frames кадрів
+        Фаза 2: DIoU Пошук + Дострокова Реініціалізація + Очікування
+            - DIoU matching для швидкорухомих об'єктів
+            - Early reinit якщо conf >= waiting_reinit_conf_threshold та diou >= waiting_reinit_diou_threshold
+            - Grace period до max_lost_frames кадрів
         Фаза 3: Реідентифікація - fallback до detection з max(conf)
 
         Args:
@@ -460,6 +483,52 @@ class YOLOeVPIoUTracker(BaseTracker):
                                 self.vpe_pending = True
                                 if self.verbose:
                                     print(f"⚠️  Кадр {self.frame_count}: VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
+
+                        x1, y1, x2, y2 = self.current_bbox
+                        return True, [x1, y1, x2 - x1, y2 - y1]
+
+                    # Перевірити чи є детекція з високою conf та прийнятним DIoU для дострокової реініціалізації
+                    waiting_reinit_idx = -1
+                    waiting_reinit_conf = 0
+                    waiting_reinit_diou = -float('inf')
+
+                    if self.waiting_reinit_conf_threshold < 1.0 and self.last_valid_bbox:
+                        for idx, box in enumerate(boxes):
+                            box_xyxy = box.xyxy[0].cpu().numpy()
+                            box_conf = float(box.conf[0].cpu().numpy())
+                            diou = self._compute_diou(self.last_valid_bbox, box_xyxy)
+
+                            # Перевірити conf та DIoU пороги
+                            if box_conf >= self.waiting_reinit_conf_threshold and diou >= self.waiting_reinit_diou_threshold:
+                                if box_conf > waiting_reinit_conf:
+                                    waiting_reinit_conf = box_conf
+                                    waiting_reinit_idx = idx
+                                    waiting_reinit_diou = diou
+
+                    # Якщо знайдено високоякісну детекцію, реініціалізувати
+                    if waiting_reinit_idx >= 0:
+                        best_box = boxes[waiting_reinit_idx]
+                        box_xyxy = best_box.xyxy[0].cpu().numpy()
+                        box_conf = float(best_box.conf[0].cpu().numpy())
+
+                        self.current_bbox = box_xyxy.tolist()
+                        self.last_valid_bbox = box_xyxy.tolist()
+                        self.lost_frames = 0  # Reset counter
+
+                        if self.verbose:
+                            print(f"🔄 Кадр {self.frame_count}: [PHASE 2] Early Reinit (conf={box_conf:.3f} >= {self.waiting_reinit_conf_threshold}, DIoU={waiting_reinit_diou:.3f} >= {self.waiting_reinit_diou_threshold})")
+
+                        # Зібрати VPE для нового bbox (якщо conf достатня)
+                        current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+                        if box_conf >= current_vpe_threshold:
+                            if self.verbose:
+                                print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                            self._collect_vpe(image, self.current_bbox)
+                            self.vpe_pending = False
+                        else:
+                            self.vpe_pending = True
+                            if self.verbose:
+                                print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
 
                         x1, y1, x2, y2 = self.current_bbox
                         return True, [x1, y1, x2 - x1, y2 - y1]
