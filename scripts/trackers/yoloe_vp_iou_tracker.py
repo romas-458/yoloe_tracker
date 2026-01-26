@@ -112,6 +112,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                  vpe_conf_threshold: float = 0.5,
                  vpe_conf_max: float = 0.5,
                  vpe_conf_adaptive_rate: int = 5,
+                 warmup_frames: int = 10,
+                 warmup_vpe_iou_threshold: float = 0.5,
                  phase2_diou_threshold: float = 1.0,
                  waiting_reinit_conf_threshold: float = 1.0,
                  waiting_reinit_diou_threshold: float = -0.5,
@@ -146,6 +148,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.vpe_conf_threshold = vpe_conf_threshold
         self.vpe_conf_max = vpe_conf_max
         self.vpe_conf_adaptive_rate = vpe_conf_adaptive_rate
+        self.warmup_frames = warmup_frames
+        self.warmup_vpe_iou_threshold = warmup_vpe_iou_threshold
         self.phase2_diou_threshold = phase2_diou_threshold
         self.waiting_reinit_conf_threshold = waiting_reinit_conf_threshold
         self.waiting_reinit_diou_threshold = waiting_reinit_diou_threshold
@@ -175,6 +179,10 @@ class YOLOeVPIoUTracker(BaseTracker):
 
         # VPE quality control
         self.vpe_pending = False  # Флаг: чи потрібно зібрати VPE при достатній conf
+
+        # Warmup period для агресивного збору VPE
+        self.in_warmup = False  # Чи знаходимось у warmup періоді
+        self.warmup_vpe_collected = 0  # Кількість VPE зібраних під час warmup
 
         # Debug info для візуалізації
         self.rejected_candidates = []  # Відкинуті кандидати у Фазі 3
@@ -221,7 +229,10 @@ class YOLOeVPIoUTracker(BaseTracker):
             else:
                 reinit_conf_msg = ""
 
-            print(f"✅ YOLOe-VP-IoU готовий (vpe_step={vpe_step}, max_vpe={max_vpe}, iou_threshold={iou_threshold}, max_lost_frames={max_lost_frames}{conf_msg}{vpe_conf_msg}{phase2_msg}{waiting_reinit_msg}{reinit_msg}{reinit_conf_msg})")
+            # Warmup info
+            warmup_msg = f", warmup={warmup_frames}fr (IoU>={warmup_vpe_iou_threshold})"
+
+            print(f"✅ YOLOe-VP-IoU готовий (vpe_step={vpe_step}, max_vpe={max_vpe}, iou_threshold={iou_threshold}, max_lost_frames={max_lost_frames}{conf_msg}{vpe_conf_msg}{warmup_msg}{phase2_msg}{waiting_reinit_msg}{reinit_msg}{reinit_conf_msg})")
 
     @classmethod
     def get_name(cls) -> str:
@@ -239,6 +250,8 @@ class YOLOeVPIoUTracker(BaseTracker):
             'max_vpe': 5,
             'max_lost_frames': 30,
             'vpe_conf_threshold': 0.5,
+            'warmup_frames': 10,
+            'warmup_vpe_iou_threshold': 0.5,
             'phase2_diou_threshold': 1.0,
             'waiting_reinit_conf_threshold': 1.0,
             'waiting_reinit_diou_threshold': -0.5,
@@ -275,6 +288,10 @@ class YOLOeVPIoUTracker(BaseTracker):
             self.initialized = True
             self.frame_count = 0
 
+            # Початок warmup періоду
+            self.in_warmup = True
+            self.warmup_vpe_collected = 0
+
             return True
 
         except Exception as e:
@@ -303,6 +320,12 @@ class YOLOeVPIoUTracker(BaseTracker):
             return False, None
 
         self.frame_count += 1
+
+        # Перевірка завершення warmup періоду
+        if self.in_warmup and self.frame_count >= self.warmup_frames:
+            self.in_warmup = False
+            if self.verbose:
+                print(f"🎯 Warmup завершено (зібрано {len(self.vpe_list)} VPE за {self.warmup_frames} кадрів)")
 
         try:
             # ========================================
@@ -399,15 +422,24 @@ class YOLOeVPIoUTracker(BaseTracker):
                     print(f"✅ Кадр {self.frame_count}: [PHASE 1] IoU Match (IoU={best_iou:.3f}, Conf={box_conf:.3f})")
 
                 # Зібрати VPE якщо час (або pending) та conf достатня
-                should_collect_vpe = (self.frame_count % self.vpe_step == 0) or self.vpe_pending
+                # Під час warmup збирати кожен кадр
+                should_collect_vpe = self.in_warmup or (self.frame_count % self.vpe_step == 0) or self.vpe_pending
 
                 if should_collect_vpe:
-                    current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+                    # Під час warmup використовувати мінімальний поріг (той що використовується для детекції)
+                    if self.in_warmup:
+                        current_vpe_threshold = self._get_adaptive_conf()  # Той самий conf що для детекції
+                    else:
+                        current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+
                     if box_conf >= current_vpe_threshold:
                         if self.verbose:
                             pending_msg = " (pending)" if self.vpe_pending else ""
-                            print(f"🔄 Кадр {self.frame_count}: Збір VPE{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                            warmup_msg = " [WARMUP]" if self.in_warmup else ""
+                            print(f"🔄 Кадр {self.frame_count}: Збір VPE{warmup_msg}{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
                         self._collect_vpe(image, self.current_bbox)
+                        if self.in_warmup:
+                            self.warmup_vpe_collected += 1
                         self.vpe_pending = False  # Зібрано, скинути флаг
                     else:
                         self.vpe_pending = True  # Встановити флаг для наступних кадрів
@@ -469,10 +501,16 @@ class YOLOeVPIoUTracker(BaseTracker):
                             print(f"✅ Кадр {self.frame_count}: [PHASE 2] DIoU Match (IoU={best_iou:.3f}, DIoU={phase2_diou_value:.3f} >= {self.phase2_diou_threshold}, Conf={box_conf:.3f})")
 
                         # Зібрати VPE якщо час (або pending) та conf достатня
-                        should_collect_vpe = (self.frame_count % self.vpe_step == 0) or self.vpe_pending
+                        # Під час warmup збирати кожен кадр
+                        should_collect_vpe = self.in_warmup or (self.frame_count % self.vpe_step == 0) or self.vpe_pending
 
                         if should_collect_vpe:
-                            current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+                            # Під час warmup використовувати мінімальний поріг (той що використовується для детекції)
+                            if self.in_warmup:
+                                current_vpe_threshold = self._get_adaptive_conf()  # Той самий conf що для детекції
+                            else:
+                                current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
                                     pending_msg = " (pending)" if self.vpe_pending else ""
@@ -519,7 +557,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                             print(f"🔄 Кадр {self.frame_count}: [PHASE 2] Early Reinit (conf={box_conf:.3f} >= {self.waiting_reinit_conf_threshold}, DIoU={waiting_reinit_diou:.3f} >= {self.waiting_reinit_diou_threshold})")
 
                         # Зібрати VPE для нового bbox (якщо conf достатня)
-                        current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+                        # Під час warmup використовувати мінімальний поріг
+                        if self.in_warmup:
+                            current_vpe_threshold = self._get_adaptive_conf()
+                        else:
+                            current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+
                         if box_conf >= current_vpe_threshold:
                             if self.verbose:
                                 print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
@@ -590,7 +633,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                             print(f"🔄 Кадр {self.frame_count}: [PHASE 3] High-Conf Re-ID (conf={box_conf:.3f} >= {self.reinit_conf_threshold})")
 
                         # Зібрати VPE для нового bbox (якщо conf достатня)
-                        current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+                        # Під час warmup використовувати мінімальний поріг
+                        if self.in_warmup:
+                            current_vpe_threshold = self._get_adaptive_conf()
+                        else:
+                            current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+
                         if box_conf >= current_vpe_threshold:
                             if self.verbose:
                                 print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
@@ -674,7 +722,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                                 print(f"🔄 Кадр {self.frame_count}: [PHASE 3] Re-ID (conf={box_conf:.3f}, DIoU={reinit_candidate_diou:.3f} >= {current_threshold:.3f})")
 
                             # Зібрати VPE для нового bbox (якщо conf достатня)
-                            current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+                            # Під час warmup використовувати мінімальний поріг
+                            if self.in_warmup:
+                                current_vpe_threshold = self._get_adaptive_conf()
+                            else:
+                                current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
                                     print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
@@ -708,7 +761,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                                 print(f"🔄 Кадр {self.frame_count}: [PHASE 3] Re-ID (max_conf={box_conf:.3f})")
 
                             # Зібрати VPE для нового bbox (якщо conf достатня)
-                            current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+                            # Під час warmup використовувати мінімальний поріг
+                            if self.in_warmup:
+                                current_vpe_threshold = self._get_adaptive_conf()
+                            else:
+                                current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
+
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
                                     print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
@@ -975,6 +1033,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.vpe_pending = False
         self.rejected_candidates = []
         self.search_candidates = []
+        self.in_warmup = False
+        self.warmup_vpe_collected = 0
 
     def get_tracking_info(self) -> Dict[str, Any]:
         """
@@ -985,6 +1045,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         """
         info = {
             'lost_frames': self.lost_frames,
+            'in_warmup': self.in_warmup,
+            'warmup_vpe_collected': len(self.vpe_list) if self.in_warmup else self.warmup_vpe_collected,
         }
 
         # У Фазі 2 (пошук/очікування) передаємо last_valid_bbox для візуалізації
