@@ -782,7 +782,22 @@ class YOLOeVPIoUTracker(BaseTracker):
                 # Обчислити IoU з last_valid_bbox (не з current!)
                 iou = self._compute_iou(self.last_valid_bbox, box_xyxy)
 
-                if iou > best_iou:
+                # Перевірка розміру: відхилити детекції зі значною зміною розміру
+                last_valid_w = self.last_valid_bbox[2] - self.last_valid_bbox[0]
+                last_valid_h = self.last_valid_bbox[3] - self.last_valid_bbox[1]
+                box_w = box_xyxy[2] - box_xyxy[0]
+                box_h = box_xyxy[3] - box_xyxy[1]
+
+                size_ratio_w = box_w / (last_valid_w + 1e-6)
+                size_ratio_h = box_h / (last_valid_h + 1e-6)
+
+                # Допускаємо зміну розміру в діапазоні 0.5-2.0 (50%-200%)
+                size_valid = (0.5 <= size_ratio_w <= 2.0) and (0.5 <= size_ratio_h <= 2.0)
+
+                if self.verbose and iou > 0.15 and not size_valid:
+                    print(f"   ⚠️  Box {idx}: IoU={iou:.3f} але size_ratio W/H={size_ratio_w:.2f}/{size_ratio_h:.2f} - відхилено")
+
+                if iou > best_iou and size_valid:
                     best_iou = iou
                     best_iou_idx = idx
 
@@ -790,7 +805,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                     best_conf = box_conf
                     best_conf_idx = idx
 
-            # Перевірка IoU threshold
+            # Перевірка IoU threshold та розміру
             if best_iou >= self.iou_threshold:
                 # ========================================
                 # ФАЗА 1: УСПІШНИЙ IoU MATCHING
