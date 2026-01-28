@@ -465,6 +465,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.rejected_candidates = []  # Відкинуті кандидати у Фазі 3
         self.search_candidates = []  # Всі detections під час Phase 2/3 для візуалізації
         self.top_candidates = []  # Top candidates з IoU scores у Phase 1 для візуалізації
+        self.last_bbox_is_kalman_only = False  # Чи є поточний bbox тільки від Калмана (не валідовано детекціями)
 
         if self.verbose:
             # Conf adaptive info
@@ -760,9 +761,15 @@ class YOLOeVPIoUTracker(BaseTracker):
                     if self.use_kalman and kalman_prediction is not None:
                         if self.verbose:
                             print(f"   🔮 Використовуємо Калман прогноз (no detections)")
+                        # Оновити current_bbox на Kalman prediction для неперервності траєкторії
+                        x, y, w, h = kalman_prediction  # xywh
+                        self.current_bbox = [x, y, x + w, y + h]  # convert to xyxy
+                        self.last_bbox_is_kalman_only = True  # Відмітити, що це не валідовано детекціями
                         return True, kalman_prediction
                     else:
                         x1, y1, x2, y2 = self.last_valid_bbox
+                        self.current_bbox = [x1, y1, x2, y2]  # Also update for consistency
+                        self.last_bbox_is_kalman_only = False
                         return True, [x1, y1, x2 - x1, y2 - y1]
 
             boxes = results[0].boxes
@@ -846,6 +853,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                 self.last_valid_bbox = self.current_bbox  # Оновити валідний bbox
                 self.lost_frames = 0  # Reset counter
+                self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
                 # Зберегти top candidates з IoU scores для візуалізації (навіть при успіху Phase 1)
                 self.top_candidates = []
@@ -963,6 +971,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                         self.last_valid_bbox = self.current_bbox
                         self.lost_frames = 0  # Reset counter
+                        self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
                         self.search_candidates = []  # Очистити кандидатів (Phase 2 - знайдено)
 
                         if self.verbose:
@@ -1063,6 +1072,10 @@ class YOLOeVPIoUTracker(BaseTracker):
                     # Якщо є Калман прогноз, повертаємо його замість False
                     # Це дозволяє продовжити трекінг з прогнозом під час короткочасної втрати
                     if self.use_kalman and kalman_prediction is not None:
+                        # Оновити current_bbox на Kalman prediction для неперервності траєкторії
+                        x, y, w, h = kalman_prediction  # xywh
+                        self.current_bbox = [x, y, x + w, y + h]  # convert to xyxy
+                        self.last_bbox_is_kalman_only = True  # Відмітити, що це не валідовано детекціями
                         return True, kalman_prediction
                     else:
                         # Не оновлюємо bbox, повертаємо False (втрачений для евалюації)
@@ -1120,6 +1133,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                         self.last_valid_bbox = self.current_bbox
                         self.lost_frames = 0  # Reset counter
+                        self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
                         self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
 
                         if self.verbose:
@@ -1219,6 +1233,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                             self.last_valid_bbox = self.current_bbox  # Новий валідний bbox
                             self.lost_frames = 0  # Reset counter
+                            self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
                             self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
 
                             if self.verbose:
@@ -1268,6 +1283,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                             self.last_valid_bbox = self.current_bbox  # Новий валідний bbox
                             self.lost_frames = 0  # Reset counter
+                            self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
                             if self.verbose:
                                 kalman_suffix = " + Kalman" if self.use_kalman else ""
@@ -1547,6 +1563,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.rejected_candidates = []
         self.search_candidates = []
         self.top_candidates = []
+        self.last_bbox_is_kalman_only = False
         self.in_warmup = False
         self.warmup_vpe_collected = 0
         self.kalman = None  # Скинути Калман фільтр
@@ -1581,6 +1598,9 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Всі detections під час Phase 2/3 для візуалізації
         if len(self.search_candidates) > 0:
             info['search_candidates'] = self.search_candidates
+
+        # Флаг: чи є поточний bbox тільки від Калмана (не валідовано детекціями)
+        info['last_bbox_is_kalman_only'] = self.last_bbox_is_kalman_only
 
         return info
 
