@@ -464,6 +464,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Debug info для візуалізації
         self.rejected_candidates = []  # Відкинуті кандидати у Фазі 3
         self.search_candidates = []  # Всі detections під час Phase 2/3 для візуалізації
+        self.top_candidates = []  # Top candidates з IoU scores у Phase 1 для візуалізації
 
         if self.verbose:
             # Conf adaptive info
@@ -800,6 +801,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                 # Оновити bbox (з Калманом якщо увімкнено)
                 detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
+                samurai_info = None  # Ініціалізувати
                 if self.use_kalman and self.kalman is not None:
                     # ✨ Phase 3: Зібрати всі детекції для SAMURAI гібридної оцінки
                     all_detections = []
@@ -829,7 +831,28 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                 self.last_valid_bbox = self.current_bbox  # Оновити валідний bbox
                 self.lost_frames = 0  # Reset counter
-                self.search_candidates = []  # Очистити кандидатів (Phase 1 - знайдено)
+
+                # Зберегти top candidates з IoU scores для візуалізації (навіть при успіху Phase 1)
+                self.top_candidates = []
+                if self.use_kalman and samurai_info and 'iou_scores' in samurai_info:
+                    iou_scores = samurai_info['iou_scores']
+                    if len(iou_scores) > 0:
+                        # Отримати top 3 кандидати
+                        top_indices = np.argsort(iou_scores)[::-1][:3]
+                        for idx in top_indices:
+                            if idx < len(boxes):
+                                box = boxes[idx]
+                                box_xyxy = box.xyxy[0].cpu().numpy()
+                                box_conf = float(box.conf[0].cpu().numpy())
+                                x1, y1, x2, y2 = box_xyxy
+                                self.top_candidates.append({
+                                    'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                    'iou': float(iou_scores[idx]),
+                                    'conf': box_conf,
+                                    'is_best_match': (idx == best_iou_idx)  # Відмітити найкращий матч
+                                })
+
+                self.search_candidates = []  # Очистити search candidates (Phase 2/3)
 
                 if self.verbose:
                     if self.use_kalman:
@@ -877,6 +900,9 @@ class YOLOeVPIoUTracker(BaseTracker):
                     # ФАЗА 2: ПОШУК-ОЧІКУВАННЯ з DIoU
                     # ========================================
 
+                    # Очистити top candidates (вони були для Phase 1)
+                    self.top_candidates = []
+
                     # Зберегти всі detections для візуалізації
                     self.search_candidates = []
                     for box in boxes:
@@ -922,7 +948,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                         self.last_valid_bbox = self.current_bbox
                         self.lost_frames = 0  # Reset counter
-                        # Не очищаємо search_candidates тут - візуалізація покаже що було знайдено серед кандидатів
+                        self.search_candidates = []  # Очистити кандидатів (Phase 2 - знайдено)
 
                         if self.verbose:
                             kalman_suffix = " + Kalman" if self.use_kalman else ""
@@ -1079,6 +1105,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                         self.last_valid_bbox = self.current_bbox
                         self.lost_frames = 0  # Reset counter
+                        self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
 
                         if self.verbose:
                             kalman_suffix = " + Kalman" if self.use_kalman else ""
@@ -1177,6 +1204,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                             self.last_valid_bbox = self.current_bbox  # Новий валідний bbox
                             self.lost_frames = 0  # Reset counter
+                            self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
 
                             if self.verbose:
                                 kalman_suffix = " + Kalman" if self.use_kalman else ""
@@ -1503,6 +1531,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.vpe_pending = False
         self.rejected_candidates = []
         self.search_candidates = []
+        self.top_candidates = []
         self.in_warmup = False
         self.warmup_vpe_collected = 0
         self.kalman = None  # Скинути Калман фільтр
@@ -1525,6 +1554,10 @@ class YOLOeVPIoUTracker(BaseTracker):
             if self.last_valid_bbox:
                 x1, y1, x2, y2 = self.last_valid_bbox
                 info['last_valid_bbox'] = [x1, y1, x2 - x1, y2 - y1]  # [x, y, w, h]
+
+        # Top candidates з IoU scores у Phase 1 для візуалізації
+        if self.lost_frames == 0 and len(self.top_candidates) > 0:
+            info['top_candidates'] = self.top_candidates
 
         # Відкинуті кандидати з Фази 3 для візуалізації
         if len(self.rejected_candidates) > 0:
