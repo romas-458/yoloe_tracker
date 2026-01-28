@@ -609,12 +609,26 @@ class ModularEvaluator:
             cv2.putText(image, f"Searching (lost={lost_frames})", (x, y - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
 
-        # Predicted bbox (активний трекінг) - зелений
+        # Predicted bbox (активний трекінг)
         if pred_bbox:
             x, y, w, h = [int(v) for v in pred_bbox]
-            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(image, "Pred", (x, y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # Перевірити чи це Kalman-only bbox (не валідовано детекціями)
+            is_kalman_only = tracking_info.get('last_bbox_is_kalman_only', False) if tracking_info else False
+
+            if is_kalman_only:
+                # Фіолетовий пунктирний для Kalman-only
+                color = (255, 0, 255)  # Фіолетовий
+                thickness = 2
+                self._draw_dashed_rectangle(image, (x, y), (x + w, y + h), color, thickness)
+                cv2.putText(image, "Kalman Only", (x, y - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            else:
+                # Зелений для валідованих детекцій
+                color = (0, 255, 0)  # Зелений
+                cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+                cv2.putText(image, "Pred", (x, y - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         if gt_bbox:
             x, y, w, h = [int(v) for v in gt_bbox]
