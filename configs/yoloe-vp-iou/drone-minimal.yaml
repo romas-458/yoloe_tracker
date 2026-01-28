@@ -1,0 +1,23 @@
+# YOLOe-VP-IoU мінімальна конфігурація для дронів
+name: "YOLOe-VP-IoU Drone Minimal"
+description: "Мінімальна конфігурація для швидкого тестування на дронах"
+tracker: "YOLOe-VP-IoU"
+created_date: "2026-01-28"
+version: "1.0"
+tags:
+  - "yoloe-vp-iou"
+  - "drone"
+  - "minimal"
+  - "fast-motion"
+
+# Параметри
+vpe_step: 5
+max_vpe: 100
+conf: 0.05
+iou_threshold: 0.1
+vpe_conf_threshold: 0.05
+max_lost_frames: 1
+reinit_diou_threshold: -0.4
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 50
+verbose: true

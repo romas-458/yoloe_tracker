@@ -1,0 +1,32 @@
+# YOLOe-VP-IoU з SAMURAI Kalman фільтром
+name: "YOLOe-VP-IoU SAMURAI Base"
+description: "YOLOe-VP-IoU з SAMURAI Kalman фільтром для покращеного трекінгу"
+tracker: "YOLOe-VP-IoU"
+created_date: "2026-01-28"
+version: "1.0"
+tags:
+  - "yoloe-vp-iou"
+  - "samurai"
+  - "kalman"
+  - "enhanced-tracking"
+
+# YOLOe-VP-IoU параметри
+vpe_step: 5
+max_vpe: 100
+conf: 0.05
+iou_threshold: 0.1
+vpe_conf_threshold: 0.3
+max_lost_frames: 15
+
+# SAMURAI Kalman параметри
+use_kalman: true
+use_samurai_kalman: true
+kalman_alpha_kf: 0.15              # Motion 15%, Appearance 85%
+kalman_tau_kf: 3                   # Stability gate: 3 успішних фреймів
+kalman_n_max: 5                    # Memory bank: 5 кадрів
+kalman_iou_threshold: 0.3          # Мінімальний IoU для успіху
+
+# Параметри Kalman для середньої динаміки
+kalman_process_noise: 1.0
+kalman_measurement_noise: 0.316
+verbose: true

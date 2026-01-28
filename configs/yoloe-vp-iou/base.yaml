@@ -1,0 +1,18 @@
+# YOLOe-VP-IoU базова конфігурація
+name: "YOLOe-VP-IoU Base"
+description: "Базова конфігурація для YOLOe-VP-IoU трекера"
+tracker: "YOLOe-VP-IoU"
+created_date: "2026-01-28"
+version: "1.0"
+tags:
+  - "yoloe-vp-iou"
+  - "base"
+  - "standard"
+
+# Параметри
+vpe_step: 10
+max_vpe: 100
+conf: 0.05
+iou_threshold: 0.1
+vpe_conf_threshold: 0.3
+max_lost_frames: 5

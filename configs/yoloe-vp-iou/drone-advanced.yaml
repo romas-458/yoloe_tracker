@@ -1,0 +1,36 @@
+# YOLOe-VP-IoU розширена конфігурація для дронів
+name: "YOLOe-VP-IoU Drone Advanced"
+description: "Розширена конфігурація з реініціалізацією та адаптивною впевненістю"
+tracker: "YOLOe-VP-IoU"
+created_date: "2026-01-28"
+version: "1.0"
+tags:
+  - "yoloe-vp-iou"
+  - "drone"
+  - "advanced"
+  - "fast-motion"
+
+# Параметри
+vpe_step: 5
+max_vpe: 200
+iou_threshold: 0.5
+warmup_frames: 0
+phase2_diou_threshold: -0.2
+max_lost_frames: 15
+conf: 0.001
+conf_max: 0.1
+conf_adaptive_rate: 30
+reinit_conf_threshold: 0.3
+waiting_reinit_conf_threshold: 0.25
+waiting_reinit_diou_threshold: -0.4
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.2
+adaptive_rate: 50
+use_kalman: false
+use_samurai_kalman: true
+kalman_process_noise: 0.001 
+kalman_measurement_noise: 0.0001
+reinit_diou_threshold: -0.6
+reinit_diou_max: -0.8
+reinit_adaptive_rate: 25
+verbose: false
