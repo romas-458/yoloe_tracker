@@ -26,6 +26,9 @@ import pandas as pd
 # Імпорт трекерів
 from trackers import TrackerRegistry, BaseTracker
 
+# Імпорт конфігу
+from config_loader import ConfigLoader
+
 
 @dataclass
 class VideoResult:
@@ -512,7 +515,7 @@ class ModularEvaluator:
             x, y, w, h = [int(v) for v in prev_bbox]
             # Пунктирний прямокутник
             self._draw_dashed_rectangle(image, (x, y), (x + w, y + h), (128, 128, 128), 1)
-            cv2.putText(image, "Prev", (x, y - 5),
+            cv2.putText(image, "Prevaaaaaa", (x, y - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
 
         # Топ-3 кандидати з IoU (різні кольори)
@@ -1032,6 +1035,8 @@ def main():
     # Параметри трекерів
     parser.add_argument('--tracker-params', type=str,
                         help='JSON з параметрами трекера, напр. \'{"process_noise": 2.0}\'')
+    parser.add_argument('--tracker-config', type=str,
+                        help='Шлях до файлу з параметрами трекера (YAML/JSON, напр. configs/yoloe-vp-iou.yaml)')
     parser.add_argument('--model', type=str, default='yoloe-26s-seg-pf.pt',
                         help='Шлях до моделі (для YOLOe/FastSAM трекерів)')
     parser.add_argument('--imgsz', type=int, default=384,
@@ -1068,8 +1073,29 @@ def main():
             'iou_threshold': args.iou_threshold,
         }
 
+    # Завантажити параметри з файлу конфігу (--tracker-config)
+    if args.tracker_config:
+        try:
+            config_loader = ConfigLoader()
+            config_params = config_loader.load(args.tracker_config)
+            tracker_params.update(config_params)
+
+            # Завантажити метадані для інформативного виводу
+            try:
+                metadata = config_loader.load_metadata(args.tracker_config)
+                if metadata.name:
+                    print(f"📄 Конфіг: {metadata.name}")
+                if metadata.description:
+                    print(f"   {metadata.description}")
+            except:
+                pass
+
+        except Exception as e:
+            print(f"❌ Помилка завантаження конфігу: {e}")
+            return
+
     # Потім перезаписуємо параметрами з --tracker-params (якщо є)
-    # Це дає пріоритет --tracker-params над окремими аргументами
+    # Це дає пріоритет --tracker-params над конфігом та окремими аргументами
     if args.tracker_params:
         try:
             custom_params = json.loads(args.tracker_params)
