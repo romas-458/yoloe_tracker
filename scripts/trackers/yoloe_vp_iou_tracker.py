@@ -375,6 +375,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                  kalman_tau_kf: int = 3,
                  kalman_n_max: int = 5,
                  kalman_iou_threshold: float = 0.3,
+                 hybrid_conf_weight: float = 0.8,
                  verbose: bool = False,
                  **kwargs):
         super().__init__(**kwargs)
@@ -419,6 +420,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.kalman_tau_kf = kalman_tau_kf
         self.kalman_n_max = kalman_n_max
         self.kalman_iou_threshold = kalman_iou_threshold
+        self.hybrid_conf_weight = hybrid_conf_weight
         self.verbose = verbose
 
         # Kalman filter (опціональний)
@@ -435,6 +437,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             print(f"   α_kf={self.kalman_alpha_kf} (motion вага)")
             print(f"   τ_kf={self.kalman_tau_kf} (stability gate поріг)")
             print(f"   N_max={self.kalman_n_max} (memory bank розмір)")
+            print(f"   hybrid_conf_weight={self.hybrid_conf_weight} (вага conf в гібридній оцінці: IoU={1-self.hybrid_conf_weight:.1%}, conf={self.hybrid_conf_weight:.1%})")
 
         # Ініціалізація моделі
         if self.verbose:
@@ -445,7 +448,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
         # VPE collection
         self.vpe_list = deque(maxlen=max_vpe)
-        self.frame_count = 0
+        self.frame_count = -1
         self.current_bbox = None
         self.aggregated_vpe = None
         self.initialized = False
@@ -571,6 +574,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                 print(f"✅ Ініціалізація з bbox: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
 
             # Зібрати перший VPE
+            if self.verbose:
+                print(f"🔄 Кадр 1: Збір VPE [INIT] (VPE=1/{self.max_vpe})")
             self._collect_vpe(image, self.current_bbox)
 
             # Ініціалізація Калман фільтру якщо увімкнено
@@ -584,7 +589,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                     print(f"   🎯 Калман фільтр ініціалізовано (process_noise={self.kalman_process_noise}, measurement_noise={self.kalman_measurement_noise})")
 
             self.initialized = True
-            self.frame_count = 0
+            self.frame_count = 1
 
             # Початок warmup періоду
             self.in_warmup = True
@@ -630,9 +635,11 @@ class YOLOeVPIoUTracker(BaseTracker):
                 affinity_scores = np.array([d['conf'] for d in all_detections])
 
                 # Phase 2: Обчислити гібридну оцінку (Equation 7)
+                # hybrid_conf_weight контролює вагу conf (affinity) в гібридній оцінці
+                # Більш висока вага = більше довірятися conf, менше IoU
                 hybrid_scores = (
-                    self.kalman_alpha_kf * iou_scores +
-                    (1 - self.kalman_alpha_kf) * affinity_scores
+                    (1 - self.hybrid_conf_weight) * iou_scores +
+                    self.hybrid_conf_weight * affinity_scores
                 )
 
                 # Визначити чи було успішне оновлення
@@ -640,12 +647,22 @@ class YOLOeVPIoUTracker(BaseTracker):
                 is_successful = (iou_scores[best_idx] >= self.kalman_iou_threshold)
 
                 if self.verbose:
+                    # Логування всіх SAMURAI кандидатів
+                    sorted_indices = np.argsort(hybrid_scores)[::-1]
+                    for rank, idx in enumerate(sorted_indices):
+                        conf = all_detections[idx]['conf']
+                        status = "BEST" if idx == best_idx else ""
+                        print(f"   ✨ SAMURAI Box {rank+1} (idx={idx}): IoU={iou_scores[idx]:.3f}, "
+                              f"affinity={affinity_scores[idx]:.3f}, hybrid={hybrid_scores[idx]:.3f}, "
+                              f"conf={conf:.3f} {status}")
+
                     motion_conf = compute_motion_confidence(
                         self.kalman.successful_frames,
                         tau_kf=self.kalman_tau_kf
                     )
-                    print(f"   ✨ SAMURAI: IoU={iou_scores[best_idx]:.3f}, affinity={affinity_scores[best_idx]:.3f}, "
-                          f"hybrid={hybrid_scores[best_idx]:.3f}, motion_conf={motion_conf:.2f}")
+                    print(f"   ✨ SAMURAI SELECTED: Box {best_idx} | IoU={iou_scores[best_idx]:.3f}, "
+                          f"affinity={affinity_scores[best_idx]:.3f}, hybrid={hybrid_scores[best_idx]:.3f}, "
+                          f"motion_conf={motion_conf:.2f}")
 
                 # Phase 1: Stability gate оновлення
                 smoothed_bbox = self.kalman.update(detected_bbox_xywh, is_successful=is_successful)
@@ -654,6 +671,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                     'iou_scores': iou_scores,
                     'affinity_scores': affinity_scores,
                     'hybrid_scores': hybrid_scores,
+                    'best_idx': best_idx,
                     'is_successful': is_successful,
                     'motion_active': self.kalman.use_motion,
                     'successful_frames': self.kalman.successful_frames
@@ -694,6 +712,11 @@ class YOLOeVPIoUTracker(BaseTracker):
             return False, None
 
         self.frame_count += 1
+
+        # Очистити candidates з попереднього фрейму на початку кожного update
+        self.top_candidates = []
+        self.rejected_candidates = []
+        self.search_candidates = []
 
         # Перевірка завершення warmup періоду
         if self.in_warmup and self.frame_count >= self.warmup_frames:
@@ -782,6 +805,9 @@ class YOLOeVPIoUTracker(BaseTracker):
             best_conf_idx = -1
             best_conf = 0
 
+            # Зберегти інформацію про всі кандидати для логування
+            all_candidates_info = []
+
             for idx, box in enumerate(boxes):
                 box_xyxy = box.xyxy[0].cpu().numpy()
                 box_conf = float(box.conf[0].cpu().numpy())
@@ -801,8 +827,16 @@ class YOLOeVPIoUTracker(BaseTracker):
                 # Допускаємо зміну розміру в діапазоні 0.5-2.0 (50%-200%)
                 size_valid = (0.5 <= size_ratio_w <= 2.0) and (0.5 <= size_ratio_h <= 2.0)
 
-                if self.verbose and iou > 0.15 and not size_valid:
-                    print(f"   ⚠️  Box {idx}: IoU={iou:.3f} але size_ratio W/H={size_ratio_w:.2f}/{size_ratio_h:.2f} - відхилено")
+                # Зберегти інформацію про кандидата
+                all_candidates_info.append({
+                    'idx': idx,
+                    'conf': box_conf,
+                    'iou': iou,
+                    'size_ratio_w': size_ratio_w,
+                    'size_ratio_h': size_ratio_h,
+                    'size_valid': size_valid,
+                    'box_xyxy': box_xyxy
+                })
 
                 if iou > best_iou and size_valid:
                     best_iou = iou
@@ -811,6 +845,14 @@ class YOLOeVPIoUTracker(BaseTracker):
                 if box_conf > best_conf:
                     best_conf = box_conf
                     best_conf_idx = idx
+
+            # Логування всіх кандидатів для звичайного IoU
+            if self.verbose and not self.use_samurai_kalman and len(all_candidates_info) > 0:
+                for cand in all_candidates_info:
+                    if cand['size_valid']:
+                        print(f"   ✅ Box {cand['idx']}: IoU={cand['iou']:.3f}, conf={cand['conf']:.3f} (W/H={cand['size_ratio_w']:.2f}/{cand['size_ratio_h']:.2f})")
+                    else:
+                        print(f"   ⚠️  Box {cand['idx']}: IoU={cand['iou']:.3f}, conf={cand['conf']:.3f} (W/H={cand['size_ratio_w']:.2f}/{cand['size_ratio_h']:.2f}) - size_ratio невалідна")
 
             # Перевірка IoU threshold та розміру
             if best_iou >= self.iou_threshold:
@@ -855,25 +897,49 @@ class YOLOeVPIoUTracker(BaseTracker):
                 self.lost_frames = 0  # Reset counter
                 self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
-                # Зберегти top candidates з IoU scores для візуалізації (навіть при успіху Phase 1)
+                # Зберегти candidates для візуалізації
                 self.top_candidates = []
-                if self.use_kalman and samurai_info and 'iou_scores' in samurai_info:
+
+                if self.use_samurai_kalman and samurai_info and 'iou_scores' in samurai_info:
+                    # Для SAMURAI: зберігати ВСІ кандидати з SAMURAI IoU scores, сортовані по hybrid score
                     iou_scores = samurai_info['iou_scores']
+                    affinity_scores = samurai_info.get('affinity_scores', np.zeros_like(iou_scores))
+                    hybrid_scores = samurai_info.get('hybrid_scores', iou_scores)
+                    best_idx_samurai = samurai_info.get('best_idx', np.argmax(hybrid_scores))
+
+
                     if len(iou_scores) > 0:
-                        # Отримати top 3 кандидати
-                        top_indices = np.argsort(iou_scores)[::-1][:3]
-                        for idx in top_indices:
+                        sorted_indices = np.argsort(hybrid_scores)[::-1]
+                        for rank, idx in enumerate(sorted_indices):
                             if idx < len(boxes):
                                 box = boxes[idx]
                                 box_xyxy = box.xyxy[0].cpu().numpy()
                                 box_conf = float(box.conf[0].cpu().numpy())
                                 x1, y1, x2, y2 = box_xyxy
+                                is_best = (idx == best_idx_samurai)
                                 self.top_candidates.append({
                                     'bbox': [x1, y1, x2 - x1, y2 - y1],
                                     'iou': float(iou_scores[idx]),
+                                    'affinity': float(affinity_scores[idx]),
+                                    'hybrid': float(hybrid_scores[idx]),
                                     'conf': box_conf,
-                                    'is_best_match': (idx == best_iou_idx)  # Відмітити найкращий матч
+                                    'is_best_match': is_best,
+                                    'type': 'samurai'
                                 })
+                else:
+                    # Для звичайного IoU: зберігати ВСІ кандидати з IoU до last_valid_bbox, сортовані по IoU
+                    if len(all_candidates_info) > 0:
+                        sorted_candidates = sorted(all_candidates_info, key=lambda x: x['iou'], reverse=True)
+                        for cand in sorted_candidates:
+                            x1, y1, x2, y2 = cand['box_xyxy']
+                            self.top_candidates.append({
+                                'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                'iou': cand['iou'],
+                                'conf': cand['conf'],
+                                'is_best_match': (cand['idx'] == best_iou_idx),
+                                'size_valid': cand['size_valid'],
+                                'type': 'standard'
+                            })
 
                 self.search_candidates = []  # Очистити search candidates (Phase 2/3)
 
@@ -1555,7 +1621,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         """Скидання стану трекера"""
         super().reset()
         self.vpe_list.clear()
-        self.frame_count = 0
+        self.frame_count = -1
         self.aggregated_vpe = None
         self.last_valid_bbox = None
         self.lost_frames = 0
