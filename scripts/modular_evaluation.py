@@ -518,40 +518,124 @@ class ModularEvaluator:
             cv2.putText(image, "Prevaaaaaa", (x, y - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (128, 128, 128), 1)
 
-        # Топ-3 кандидати з IoU (різні кольори)
+        # Кандидати з IoU (разні кольори для різних позицій)
         if tracking_info and tracking_info.get('top_candidates'):
+            # Паліття кольорів для більш ніж 3 кандидатів
             colors = [
                 (255, 200, 0),   # Блакитний - 1-й кандидат
                 (255, 150, 0),   # Помаранчевий - 2-й кандидат
-                (255, 100, 0)    # Темно-помаранчевий - 3-й кандидат
+                (255, 100, 0),   # Темно-помаранчевий - 3-й кандидат
+                (0, 165, 255),   # Помаранчевий (BGR) - 4-й
+                (173, 255, 47),  # Зелено-жовтий - 5-й
+                (240, 255, 240)  # Світло-блакитний - решта
             ]
+
+            candidate_type = tracking_info['top_candidates'][0].get('type', 'standard') if tracking_info['top_candidates'] else 'standard'
+
+            # Крок 1: Знайти best кандидата
+            best_idx = None
             for idx, candidate in enumerate(tracking_info['top_candidates']):
+                if candidate.get('is_best_match', False):
+                    best_idx = idx
+                    break
+
+            # Крок 1a: Намалювати ббокси - спочатку non-best, потім best поверху
+            for idx, candidate in enumerate(tracking_info['top_candidates']):
+                if idx == best_idx:
+                    continue  # Пропустити best - малюємо його потім
+
                 bbox = candidate['bbox']
-                iou = candidate.get('iou', 0.0)
-
                 x, y, w, h = [int(v) for v in bbox]
-                color = colors[idx] if idx < len(colors) else (200, 200, 200)
-
+                color = colors[idx % len(colors)]
                 cv2.rectangle(image, (x, y), (x + w, y + h), color, 1)
 
-                # Адаптивний текст в залежності від доступних даних
-                text_parts = [f"C{idx+1}: IoU={iou:.2f}"]
+            # Малюємо best ббокс поверху всіх (з товщиною 2)
+            if best_idx is not None:
+                candidate = tracking_info['top_candidates'][best_idx]
+                bbox = candidate['bbox']
+                x, y, w, h = [int(v) for v in bbox]
+                color = colors[best_idx % len(colors)]
+                cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
 
-                # Додати class_id якщо доступний (YOLOe-ClassReinit)
-                if 'class_id' in candidate:
-                    text_parts.append(f"cls={candidate['class_id']}")
+            # Крок 1b: Намалювати номери всередину ббоксу (для всіх у оригинальному порядку)
+            for idx, candidate in enumerate(tracking_info['top_candidates']):
+                bbox = candidate['bbox']
+                x, y, w, h = [int(v) for v in bbox]
+                color = colors[idx % len(colors)]  # Визначити колір для цього кандидата
 
-                # Додати feature similarity якщо доступна (YOLOe-Feature)
-                if 'feature_similarity' in candidate:
-                    text_parts.append(f"feat={candidate['feature_similarity']:.2f}")
+                # Намалювати номер всередину ббоксу в лівому нижньому куті
+                text_number = f"{idx+1}"
+                font_scale = 0.4
+                font_thickness = 2
+                text_size = cv2.getTextSize(text_number, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0]
 
-                # Додати score якщо доступний (YOLOe-Feature)
-                if 'score' in candidate:
-                    text_parts.append(f"sc={candidate['score']:.2f}")
+                # Позиція: лівий нижній кут ббоксу з невеликим зміщенням
+                text_x = x + 5
+                text_y = y + h - 5
 
-                text = " ".join(text_parts)
-                cv2.putText(image, text, (x, y + h + 15),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                # Малий фон для номера
+                cv2.rectangle(image, (text_x - 2, text_y - text_size[1] - 2),
+                             (text_x + text_size[0] + 2, text_y + 2), color, -1)
+                cv2.putText(image, text_number, (text_x, text_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), font_thickness)
+
+            # Крок 2: Створити таблицю з інформацією у верхньому лівому куті
+            candidates = tracking_info['top_candidates']
+
+            if candidate_type == 'samurai':
+                # Таблиця для SAMURAI: # | IoU | aff | hyb | conf | status
+                table_header = "# | IoU    | aff    | hyb    | conf   |"
+                table_lines = [table_header, "-" * len(table_header)]
+
+                for idx, candidate in enumerate(candidates):
+                    iou = candidate.get('iou', 0.0)
+                    affinity = candidate.get('affinity', 0.0)
+                    hybrid = candidate.get('hybrid', 0.0)
+                    conf = candidate.get('conf', 0.0)
+                    is_best = candidate.get('is_best_match', False)
+
+                    status = "⭐BEST" if is_best else ""
+                    line = f"{idx+1} | {iou:.3f} | {affinity:.3f} | {hybrid:.3f} | {conf:.3f} | {status}"
+                    table_lines.append(line)
+            else:
+                # Таблиця для standard: # | IoU | conf | size | status
+                table_header = "# | IoU    | conf   | size | status"
+                table_lines = [table_header, "-" * len(table_header)]
+
+                for idx, candidate in enumerate(candidates):
+                    iou = candidate.get('iou', 0.0)
+                    conf = candidate.get('conf', 0.0)
+                    size_valid = candidate.get('size_valid', True)
+                    is_best = candidate.get('is_best_match', False)
+
+                    size_status = "✅" if size_valid else "⚠️"
+                    status = "⭐BEST" if is_best else ""
+                    line = f"{idx+1} | {iou:.3f} | {conf:.3f} | {size_status} | {status}"
+                    table_lines.append(line)
+
+            # Намалювати таблицю в лівому верхньому куті
+            font_size = 0.35
+            font_thickness = 1
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            line_height = 18
+
+            # Фон для таблиці
+            table_height = len(table_lines) * line_height + 10
+            cv2.rectangle(image, (5, 5), (400, 5 + table_height), (30, 30, 30), -1)
+            cv2.rectangle(image, (5, 5), (400, 5 + table_height), (200, 200, 200), 1)
+
+            # Малювати рядки таблиці
+            for line_idx, line in enumerate(table_lines):
+                y_pos = 20 + line_idx * line_height
+
+                # Заголовок та розділювач - білий, інші рядки - сірий
+                if line_idx < 2:
+                    text_color = (255, 255, 255)
+                else:
+                    text_color = (200, 200, 200)
+
+                cv2.putText(image, line, (10, y_pos),
+                           font, font_size, text_color, font_thickness)
 
         # Відкинуті кандидати з Фази 3 (червоний пунктир)
         if tracking_info and tracking_info.get('rejected_candidates'):
