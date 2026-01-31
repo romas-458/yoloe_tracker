@@ -187,8 +187,10 @@ class DualMemoryVPE:
         # 1. Агрегація Long-term VPE
         if len(self.long_term_vpe) > 0:
             try:
-                lt_tensor = torch.cat(list(self.long_term_vpe), dim=0)
-                lt_aggregated = lt_tensor.mean(dim=0, keepdim=True)
+                # Cat по dim=1: [1,1,D] + [1,1,D] = [1,2,D]
+                lt_tensor = torch.cat(list(self.long_term_vpe), dim=1)
+                # Mean по dim=1: [1,2,D] -> [1,1,D]
+                lt_aggregated = lt_tensor.mean(dim=1, keepdim=True)
                 lt_aggregated = F.normalize(lt_aggregated, p=2, dim=-1)
                 if self.verbose:
                     print(f"   🔹 LT агрегація: {len(self.long_term_vpe)} VPE, shape={lt_aggregated.shape}")
@@ -207,16 +209,20 @@ class DualMemoryVPE:
                     weight = self.temporal_decay ** age
                     st_weights.append(weight)
 
-                st_weights = torch.tensor(st_weights, dtype=torch.float32).unsqueeze(1)
+                st_weights = torch.tensor(st_weights, dtype=torch.float32)
                 st_weights = st_weights / st_weights.sum()  # Normalize
+                # Reshape для broadcasting: [N] -> [1, N, 1]
+                st_weights = st_weights.unsqueeze(0).unsqueeze(2)
 
-                st_tensor = torch.cat(list(self.short_term_vpe), dim=0)
+                # Cat по dim=1: [1,1,D] + [1,1,D] = [1,2,D]
+                st_tensor = torch.cat(list(self.short_term_vpe), dim=1)
 
                 # Ensure same device
                 if st_tensor.device != st_weights.device:
                     st_weights = st_weights.to(st_tensor.device)
 
-                st_aggregated = (st_tensor * st_weights).sum(dim=0, keepdim=True)
+                # Weighted sum по dim=1: [1,2,D] * [1,2,1] -> sum -> [1,1,D]
+                st_aggregated = (st_tensor * st_weights).sum(dim=1, keepdim=True)
                 st_aggregated = F.normalize(st_aggregated, p=2, dim=-1)
                 if self.verbose:
                     print(f"   🔸 ST агрегація: {len(self.short_term_vpe)} VPE, shape={st_aggregated.shape}")

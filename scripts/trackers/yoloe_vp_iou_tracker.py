@@ -1535,15 +1535,15 @@ class YOLOeVPIoUTracker(BaseTracker):
                 if self._get_vpe_count() == 0:
                     return
 
-                # Об'єднати та усереднити
-                vpe_tensor = torch.cat(list(self.vpe_list), dim=0)
-                self.aggregated_vpe = vpe_tensor.mean(dim=0, keepdim=True)
+                # Об'єднати та усереднити: [1,1,D] + [1,1,D] = [1,N,D] -> [1,1,D]
+                vpe_tensor = torch.cat(list(self.vpe_list), dim=1)
+                self.aggregated_vpe = vpe_tensor.mean(dim=1, keepdim=True)
 
                 # Нормалізувати
                 self.aggregated_vpe = F.normalize(self.aggregated_vpe, p=2, dim=-1)
 
                 if self.verbose:
-                    print(f"   🔄 Агреговано {self._get_vpe_count()} VPE")
+                    print(f"   🔄 Агреговано {self._get_vpe_count()} VPE, shape={self.aggregated_vpe.shape}")
 
         except Exception as e:
             if self.verbose:
