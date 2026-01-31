@@ -1495,7 +1495,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         if self.use_dual_memory_vpe:
             return self.dual_memory.total_vpe_collected
         else:
-            return self._get_vpe_count() if self.vpe_list else 0
+            return len(self.vpe_list) if self.vpe_list else 0
 
     def _aggregate_vpe(self):
         """

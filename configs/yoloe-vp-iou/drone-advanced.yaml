@@ -12,7 +12,7 @@ tags:
 
 # Параметри
 vpe_step: 10
-max_vpe: 10
+max_vpe: 50
 iou_threshold: 0.2
 warmup_frames: 0
 phase2_diou_threshold: -0.0
