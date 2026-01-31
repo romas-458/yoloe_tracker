@@ -86,28 +86,17 @@ class DualMemoryVPE:
         Додати новий VPE до dual memory
 
         Args:
-            vpe: VPE tensor [1, D] або [1, 1, D]
+            vpe: VPE tensor [1, 1, D]
             conf: Detection confidence [0-1]
             frame_id: Номер фрейму (опційно)
         """
         if frame_id is None:
             frame_id = self.frame_count
 
-        # Normalize VPE shape to [1, D]
-        if vpe.dim() == 3:
-            # Shape [1, 1, D] -> [1, D]
-            vpe = vpe.squeeze(1)
+        # Validate VPE shape [1, 1, D]
+        if vpe.dim() != 3 or vpe.size(0) != 1 or vpe.size(1) != 1:
             if self.verbose:
-                print(f"   🔧 VPE shape normalized: [1, 1, D] -> {vpe.shape}")
-        elif vpe.dim() != 2:
-            if self.verbose:
-                print(f"   ⚠️  Некоректний shape VPE: {vpe.shape}, очікується [1, D] або [1, 1, D]")
-            return
-
-        # Validate final shape
-        if vpe.size(0) != 1:
-            if self.verbose:
-                print(f"   ⚠️  Некоректний batch size VPE: {vpe.shape}, очікується [1, D]")
+                print(f"   ⚠️  Некоректний shape VPE: {vpe.shape}, очікується [1, 1, D]")
             return
 
         # 1. Зберегти anchor (перший VPE, ніколи не видаляється)

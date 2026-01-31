@@ -785,15 +785,15 @@ class YOLOeVPIoUTracker(BaseTracker):
             # ========================================
             use_vpe = False
             if self.aggregated_vpe is not None:
-                # Validate shape before using
+                # Validate shape before using [1, 1, D]
                 if self.verbose:
                     print(f"   🔍 Aggregated VPE shape: {self.aggregated_vpe.shape}")
 
-                if self.aggregated_vpe.dim() == 2 and self.aggregated_vpe.size(0) == 1:
+                if self.aggregated_vpe.dim() == 3 and self.aggregated_vpe.size(0) == 1 and self.aggregated_vpe.size(1) == 1:
                     use_vpe = True
                 else:
                     if self.verbose:
-                        print(f"   ⚠️  Invalid aggregated VPE shape: {self.aggregated_vpe.shape}, falling back to visual prompts")
+                        print(f"   ⚠️  Invalid aggregated VPE shape: {self.aggregated_vpe.shape}, очікується [1, 1, D], falling back to visual prompts")
 
             if use_vpe:
                 # Використати агрегований VPE
@@ -1482,18 +1482,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                 return
 
             if self.verbose:
-                print(f"   📊 VPE raw shape: {vpe.shape}")
-
-            # Normalize VPE shape to [1, D]
-            if vpe.dim() == 3 and vpe.size(1) == 1:
-                # Shape [1, 1, D] -> [1, D]
-                vpe = vpe.squeeze(1)
-                if self.verbose:
-                    print(f"   🔧 VPE normalized to: {vpe.shape}")
-            elif vpe.dim() != 2:
-                if self.verbose:
-                    print(f"   ⚠️  Unexpected VPE shape: {vpe.shape}, skipping collection")
-                return
+                print(f"   📊 VPE shape: {vpe.shape}")
 
             # Додати до dual memory або simple deque
             if self.use_dual_memory_vpe:
