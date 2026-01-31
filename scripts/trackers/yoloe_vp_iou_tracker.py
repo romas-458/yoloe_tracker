@@ -1482,7 +1482,18 @@ class YOLOeVPIoUTracker(BaseTracker):
                 return
 
             if self.verbose:
-                print(f"   📊 VPE shape: {vpe.shape}")
+                print(f"   📊 VPE raw shape: {vpe.shape}")
+
+            # Normalize VPE shape to [1, D]
+            if vpe.dim() == 3 and vpe.size(1) == 1:
+                # Shape [1, 1, D] -> [1, D]
+                vpe = vpe.squeeze(1)
+                if self.verbose:
+                    print(f"   🔧 VPE normalized to: {vpe.shape}")
+            elif vpe.dim() != 2:
+                if self.verbose:
+                    print(f"   ⚠️  Unexpected VPE shape: {vpe.shape}, skipping collection")
+                return
 
             # Додати до dual memory або simple deque
             if self.use_dual_memory_vpe:
