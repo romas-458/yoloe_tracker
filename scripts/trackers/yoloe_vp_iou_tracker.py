@@ -41,6 +41,7 @@ from samurai_integration import (
     compute_motion_confidence,
     SAMURAI_DEFAULTS
 )
+from trackers.dual_memory_vpe import DualMemoryVPE
 
 
 class KalmanBoxTrackerSimple:
@@ -376,6 +377,17 @@ class YOLOeVPIoUTracker(BaseTracker):
                  kalman_n_max: int = 5,
                  kalman_iou_threshold: float = 0.3,
                  hybrid_conf_weight: float = 0.8,
+                 use_dual_memory_vpe: bool = False,
+                 dual_long_term_capacity: int = 5,
+                 dual_long_term_quality_threshold: float = 0.7,
+                 dual_long_term_weight: float = 0.4,
+                 dual_short_term_capacity: int = 10,
+                 dual_short_term_weight: float = 0.6,
+                 dual_temporal_decay: float = 0.9,
+                 dual_update_long_term_every: int = 50,
+                 dual_replace_worst_lt: bool = True,
+                 dual_use_anchor: bool = True,
+                 dual_anchor_weight: float = 0.1,
                  verbose: bool = False,
                  **kwargs):
         super().__init__(**kwargs)
@@ -421,6 +433,17 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.kalman_n_max = kalman_n_max
         self.kalman_iou_threshold = kalman_iou_threshold
         self.hybrid_conf_weight = hybrid_conf_weight
+        self.use_dual_memory_vpe = use_dual_memory_vpe
+        self.dual_long_term_capacity = dual_long_term_capacity
+        self.dual_long_term_quality_threshold = dual_long_term_quality_threshold
+        self.dual_long_term_weight = dual_long_term_weight
+        self.dual_short_term_capacity = dual_short_term_capacity
+        self.dual_short_term_weight = dual_short_term_weight
+        self.dual_temporal_decay = dual_temporal_decay
+        self.dual_update_long_term_every = dual_update_long_term_every
+        self.dual_replace_worst_lt = dual_replace_worst_lt
+        self.dual_use_anchor = dual_use_anchor
+        self.dual_anchor_weight = dual_anchor_weight
         self.verbose = verbose
 
         # Kalman filter (опціональний)
@@ -446,8 +469,32 @@ class YOLOeVPIoUTracker(BaseTracker):
         if hasattr(self.model, 'to'):
             self.model.to(device)
 
-        # VPE collection
-        self.vpe_list = deque(maxlen=max_vpe)
+        # VPE collection - dual memory or simple deque
+        if self.use_dual_memory_vpe:
+            self.dual_memory = DualMemoryVPE(
+                long_term_capacity=dual_long_term_capacity,
+                long_term_quality_threshold=dual_long_term_quality_threshold,
+                long_term_weight=dual_long_term_weight,
+                short_term_capacity=dual_short_term_capacity,
+                short_term_weight=dual_short_term_weight,
+                temporal_decay=dual_temporal_decay,
+                update_long_term_every=dual_update_long_term_every,
+                replace_worst_lt=dual_replace_worst_lt,
+                use_anchor=dual_use_anchor,
+                anchor_weight=dual_anchor_weight,
+                verbose=verbose
+            )
+            self.vpe_list = None  # Not used in dual memory mode
+            if self.verbose:
+                print(f"🧠 Dual Memory VPE активовано:")
+                print(f"   LT: capacity={dual_long_term_capacity}, quality>={dual_long_term_quality_threshold}, weight={dual_long_term_weight}")
+                print(f"   ST: capacity={dual_short_term_capacity}, weight={dual_short_term_weight}, decay={dual_temporal_decay}")
+                print(f"   Anchor: enabled={dual_use_anchor}, weight={dual_anchor_weight}")
+                print(f"   LT update: every {dual_update_long_term_every} frames, replace_worst={dual_replace_worst_lt}")
+        else:
+            self.vpe_list = deque(maxlen=max_vpe)
+            self.dual_memory = None
+
         self.frame_count = -1
         self.current_bbox = None
         self.aggregated_vpe = None
@@ -722,7 +769,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         if self.in_warmup and self.frame_count >= self.warmup_frames:
             self.in_warmup = False
             if self.verbose:
-                print(f"🎯 Warmup завершено (зібрано {len(self.vpe_list)} VPE за {self.warmup_frames} кадрів)")
+                print(f"🎯 Warmup завершено (зібрано {self._get_vpe_count()} VPE за {self.warmup_frames} кадрів)")
 
         # Калман прогноз (якщо увімкнено)
         kalman_prediction = None
@@ -967,7 +1014,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                         if self.verbose:
                             pending_msg = " (pending)" if self.vpe_pending else ""
                             warmup_msg = " [WARMUP]" if self.in_warmup else ""
-                            print(f"🔄 Кадр {self.frame_count}: Збір VPE{warmup_msg}{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                            print(f"🔄 Кадр {self.frame_count}: Збір VPE{warmup_msg}{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
                         self._collect_vpe(image, self.current_bbox)
                         if self.in_warmup:
                             self.warmup_vpe_collected += 1
@@ -975,7 +1022,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                     else:
                         self.vpe_pending = True  # Встановити флаг для наступних кадрів
                         if self.verbose:
-                            print(f"⚠️  Кадр {self.frame_count}: VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
+                            print(f"⚠️  Кадр {self.frame_count}: VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
 
                 x1, y1, x2, y2 = self.current_bbox
                 return True, [x1, y1, x2 - x1, y2 - y1]
@@ -1058,13 +1105,13 @@ class YOLOeVPIoUTracker(BaseTracker):
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
                                     pending_msg = " (pending)" if self.vpe_pending else ""
-                                    print(f"🔄 Кадр {self.frame_count}: Збір VPE{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                                    print(f"🔄 Кадр {self.frame_count}: Збір VPE{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
                                 self._collect_vpe(image, self.current_bbox)
                                 self.vpe_pending = False
                             else:
                                 self.vpe_pending = True
                                 if self.verbose:
-                                    print(f"⚠️  Кадр {self.frame_count}: VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
+                                    print(f"⚠️  Кадр {self.frame_count}: VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
 
                         x1, y1, x2, y2 = self.current_bbox
                         return True, [x1, y1, x2 - x1, y2 - y1]
@@ -1118,13 +1165,13 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                         if box_conf >= current_vpe_threshold:
                             if self.verbose:
-                                print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                                print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
                             self._collect_vpe(image, self.current_bbox)
                             self.vpe_pending = False
                         else:
                             self.vpe_pending = True
                             if self.verbose:
-                                print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
+                                print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
 
                         x1, y1, x2, y2 = self.current_bbox
                         return True, [x1, y1, x2 - x1, y2 - y1]
@@ -1215,13 +1262,13 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                         if box_conf >= current_vpe_threshold:
                             if self.verbose:
-                                print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                                print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
                             self._collect_vpe(image, self.current_bbox)
                             self.vpe_pending = False  # VPE зібрано
                         else:
                             self.vpe_pending = True  # Встановити флаг для наступних кадрів
                             if self.verbose:
-                                print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
+                                print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
 
                         x1, y1, x2, y2 = self.current_bbox
                         return True, [x1, y1, x2 - x1, y2 - y1]
@@ -1315,13 +1362,13 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
-                                    print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                                    print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
                                 self._collect_vpe(image, self.current_bbox)
                                 self.vpe_pending = False  # VPE зібрано
                             else:
                                 self.vpe_pending = True  # Встановити флаг для наступних кадрів
                                 if self.verbose:
-                                    print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
+                                    print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
 
                             x1, y1, x2, y2 = self.current_bbox
                             return True, [x1, y1, x2 - x1, y2 - y1]
@@ -1364,13 +1411,13 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
-                                    print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe})")
+                                    print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
                                 self._collect_vpe(image, self.current_bbox)
                                 self.vpe_pending = False  # VPE зібрано
                             else:
                                 self.vpe_pending = True  # Встановити флаг для наступних кадрів
                                 if self.verbose:
-                                    print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={len(self.vpe_list)}/{self.max_vpe}), спроба на наступному кадрі")
+                                    print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
 
                             x1, y1, x2, y2 = self.current_bbox
                             return True, [x1, y1, x2 - x1, y2 - y1]
@@ -1416,11 +1463,20 @@ class YOLOeVPIoUTracker(BaseTracker):
             self.model.predictor.set_prompts(visual_prompts)
             vpe = self.model.predictor.get_vpe(image)
 
-            # Додати до списку
-            self.vpe_list.append(vpe)
+            # Додати до dual memory або simple deque
+            if self.use_dual_memory_vpe:
+                # Get confidence from bbox (should be passed separately, but using default for now)
+                # In real usage, conf should be passed as parameter to _collect_vpe
+                conf = 0.8  # Placeholder - should be passed from detection
+                self.dual_memory.add_vpe(vpe, conf, self.frame_count)
 
-            if self.verbose:
-                print(f"   📥 Зібрано VPE #{len(self.vpe_list)}")
+                if self.verbose:
+                    stats = self.dual_memory.get_stats()
+                    print(f"   📥 Зібрано VPE: {self.dual_memory}")
+            else:
+                self.vpe_list.append(vpe)
+                if self.verbose:
+                    print(f"   📥 Зібрано VPE #{self._get_vpe_count()}")
 
             # Агрегувати VPE
             self._aggregate_vpe()
@@ -1429,23 +1485,44 @@ class YOLOeVPIoUTracker(BaseTracker):
             if self.verbose:
                 print(f"   ⚠️  Помилка збору VPE: {e}")
 
+    def _get_vpe_count(self) -> int:
+        """
+        Отримати кількість зібраних VPE (dual memory або simple deque)
+
+        Returns:
+            int - кількість VPE
+        """
+        if self.use_dual_memory_vpe:
+            return self.dual_memory.total_vpe_collected
+        else:
+            return self._get_vpe_count() if self.vpe_list else 0
+
     def _aggregate_vpe(self):
         """
         Агрегувати всі зібрані VPE
         """
-        if len(self.vpe_list) == 0:
-            return
-
         try:
-            # Об'єднати та усереднити
-            vpe_tensor = torch.cat(list(self.vpe_list), dim=0)
-            self.aggregated_vpe = vpe_tensor.mean(dim=0, keepdim=True)
+            if self.use_dual_memory_vpe:
+                # Use dual memory aggregation
+                self.aggregated_vpe = self.dual_memory.get_aggregated_vpe()
 
-            # Нормалізувати
-            self.aggregated_vpe = F.normalize(self.aggregated_vpe, p=2, dim=-1)
+                if self.verbose and self.aggregated_vpe is not None:
+                    stats = self.dual_memory.get_stats()
+                    print(f"   🔄 Dual Memory агрегація: LT={stats['long_term_count']}, ST={stats['short_term_count']}")
+            else:
+                # Use simple mean aggregation
+                if self._get_vpe_count() == 0:
+                    return
 
-            if self.verbose:
-                print(f"   🔄 Агреговано {len(self.vpe_list)} VPE")
+                # Об'єднати та усереднити
+                vpe_tensor = torch.cat(list(self.vpe_list), dim=0)
+                self.aggregated_vpe = vpe_tensor.mean(dim=0, keepdim=True)
+
+                # Нормалізувати
+                self.aggregated_vpe = F.normalize(self.aggregated_vpe, p=2, dim=-1)
+
+                if self.verbose:
+                    print(f"   🔄 Агреговано {self._get_vpe_count()} VPE")
 
         except Exception as e:
             if self.verbose:
@@ -1491,7 +1568,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             return self.conf
 
         # Кількість зібраних VPE
-        num_vpe = len(self.vpe_list)
+        num_vpe = self._get_vpe_count()
 
         # Якщо ще немає VPE, використовуємо початковий threshold
         if num_vpe == 0:
@@ -1519,7 +1596,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             return self.vpe_conf_threshold
 
         # Кількість зібраних VPE
-        num_vpe = len(self.vpe_list)
+        num_vpe = self._get_vpe_count()
 
         # Якщо ще немає VPE, використовуємо початковий threshold
         if num_vpe == 0:
@@ -1620,7 +1697,13 @@ class YOLOeVPIoUTracker(BaseTracker):
     def reset(self):
         """Скидання стану трекера"""
         super().reset()
-        self.vpe_list.clear()
+
+        # Reset VPE memory (dual or simple)
+        if self.use_dual_memory_vpe:
+            self.dual_memory.reset()
+        else:
+            self.vpe_list.clear()
+
         self.frame_count = -1
         self.aggregated_vpe = None
         self.last_valid_bbox = None
@@ -1644,7 +1727,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         info = {
             'lost_frames': self.lost_frames,
             'in_warmup': self.in_warmup,
-            'warmup_vpe_collected': len(self.vpe_list) if self.in_warmup else self.warmup_vpe_collected,
+            'warmup_vpe_collected': self._get_vpe_count() if self.in_warmup else self.warmup_vpe_collected,
         }
 
         # У Фазі 2 (пошук/очікування) передаємо last_valid_bbox для візуалізації
@@ -1686,7 +1769,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             phase = "PHASE 3: Re-Identification"
 
         return {
-            'num_vpe': len(self.vpe_list),
+            'num_vpe': self._get_vpe_count(),
             'max_vpe': self.max_vpe,
             'vpe_step': self.vpe_step,
             'vpe_conf_threshold': self.vpe_conf_threshold,
