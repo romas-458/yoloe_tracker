@@ -1463,6 +1463,15 @@ class YOLOeVPIoUTracker(BaseTracker):
             self.model.predictor.set_prompts(visual_prompts)
             vpe = self.model.predictor.get_vpe(image)
 
+            # Validate VPE
+            if vpe is None:
+                if self.verbose:
+                    print(f"   ⚠️  VPE is None, skipping collection")
+                return
+
+            if self.verbose:
+                print(f"   📊 VPE shape: {vpe.shape}")
+
             # Додати до dual memory або simple deque
             if self.use_dual_memory_vpe:
                 # Get confidence from bbox (should be passed separately, but using default for now)

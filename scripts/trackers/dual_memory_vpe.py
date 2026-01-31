@@ -93,13 +93,25 @@ class DualMemoryVPE:
         if frame_id is None:
             frame_id = self.frame_count
 
+        # Validate VPE shape
+        if vpe.dim() != 2 or vpe.size(0) != 1:
+            if self.verbose:
+                print(f"   ⚠️  Некоректний shape VPE: {vpe.shape}, очікується [1, D]")
+            return
+
         # 1. Зберегти anchor (перший VPE, ніколи не видаляється)
         if self.anchor_vpe is None:
             self.anchor_vpe = vpe.clone()
             self.anchor_conf = conf
             self.anchor_frame = frame_id
             if self.verbose:
-                print(f"   🎯 Anchor VPE збережено (frame={frame_id}, conf={conf:.3f})")
+                print(f"   🎯 Anchor VPE збережено (frame={frame_id}, conf={conf:.3f}, shape={vpe.shape})")
+
+        # Check shape consistency with anchor
+        if self.anchor_vpe is not None and vpe.shape != self.anchor_vpe.shape:
+            if self.verbose:
+                print(f"   ⚠️  Shape mismatch: VPE {vpe.shape} vs anchor {self.anchor_vpe.shape}")
+            return
 
         # 2. Завжди додаємо в short-term (sliding window)
         self.short_term_vpe.append(vpe.clone())
@@ -174,30 +186,44 @@ class DualMemoryVPE:
 
         # 1. Агрегація Long-term VPE
         if len(self.long_term_vpe) > 0:
-            lt_tensor = torch.cat(list(self.long_term_vpe), dim=0)
-            lt_aggregated = lt_tensor.mean(dim=0, keepdim=True)
-            lt_aggregated = F.normalize(lt_aggregated, p=2, dim=-1)
+            try:
+                lt_tensor = torch.cat(list(self.long_term_vpe), dim=0)
+                lt_aggregated = lt_tensor.mean(dim=0, keepdim=True)
+                lt_aggregated = F.normalize(lt_aggregated, p=2, dim=-1)
+                if self.verbose:
+                    print(f"   🔹 LT агрегація: {len(self.long_term_vpe)} VPE, shape={lt_aggregated.shape}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"   ⚠️  Помилка LT агрегації: {e}")
+                lt_aggregated = None
         else:
             lt_aggregated = None
 
         # 2. Агрегація Short-term VPE з temporal decay
         if len(self.short_term_vpe) > 0:
-            st_weights = []
-            for age in self.short_term_age:
-                weight = self.temporal_decay ** age
-                st_weights.append(weight)
+            try:
+                st_weights = []
+                for age in self.short_term_age:
+                    weight = self.temporal_decay ** age
+                    st_weights.append(weight)
 
-            st_weights = torch.tensor(st_weights, dtype=torch.float32).unsqueeze(1)
-            st_weights = st_weights / st_weights.sum()  # Normalize
+                st_weights = torch.tensor(st_weights, dtype=torch.float32).unsqueeze(1)
+                st_weights = st_weights / st_weights.sum()  # Normalize
 
-            st_tensor = torch.cat(list(self.short_term_vpe), dim=0)
+                st_tensor = torch.cat(list(self.short_term_vpe), dim=0)
 
-            # Ensure same device
-            if st_tensor.device != st_weights.device:
-                st_weights = st_weights.to(st_tensor.device)
+                # Ensure same device
+                if st_tensor.device != st_weights.device:
+                    st_weights = st_weights.to(st_tensor.device)
 
-            st_aggregated = (st_tensor * st_weights).sum(dim=0, keepdim=True)
-            st_aggregated = F.normalize(st_aggregated, p=2, dim=-1)
+                st_aggregated = (st_tensor * st_weights).sum(dim=0, keepdim=True)
+                st_aggregated = F.normalize(st_aggregated, p=2, dim=-1)
+                if self.verbose:
+                    print(f"   🔸 ST агрегація: {len(self.short_term_vpe)} VPE, shape={st_aggregated.shape}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"   ⚠️  Помилка ST агрегації: {e}")
+                st_aggregated = None
         else:
             st_aggregated = None
 
@@ -216,10 +242,14 @@ class DualMemoryVPE:
             final_vpe = st_aggregated
 
         # 4. Додати anchor VPE з невеликою вагою
-        if self.anchor_vpe is not None and self.use_anchor:
-            anchor_w = self.anchor_weight
-            final_vpe = (1 - anchor_w) * final_vpe + anchor_w * self.anchor_vpe
-            final_vpe = F.normalize(final_vpe, p=2, dim=-1)
+        if self.anchor_vpe is not None and self.use_anchor and final_vpe is not None:
+            # Ensure shapes match
+            if final_vpe.shape == self.anchor_vpe.shape:
+                anchor_w = self.anchor_weight
+                final_vpe = (1 - anchor_w) * final_vpe + anchor_w * self.anchor_vpe
+                final_vpe = F.normalize(final_vpe, p=2, dim=-1)
+            elif self.verbose:
+                print(f"   ⚠️  Anchor shape mismatch: final {final_vpe.shape} vs anchor {self.anchor_vpe.shape}")
 
         return final_vpe
 
