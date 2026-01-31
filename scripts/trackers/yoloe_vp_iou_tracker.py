@@ -623,7 +623,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             # Зібрати перший VPE
             if self.verbose:
                 print(f"🔄 Кадр 1: Збір VPE [INIT] (VPE=1/{self.max_vpe})")
-            self._collect_vpe(image, self.current_bbox, box_conf)
+            self._collect_vpe(image, self.current_bbox, conf=1.0)  # Use conf=1.0 for initialization
 
             # Ініціалізація Калман фільтру якщо увімкнено
             if self.use_kalman:
@@ -757,6 +757,9 @@ class YOLOeVPIoUTracker(BaseTracker):
         """
         if not self.initialized:
             return False, None
+
+        # Ініціалізація box_conf для VPE collection
+        box_conf = 0.0  # Default value, буде оновлено при знаходженні detection
 
         self.frame_count += 1
 
