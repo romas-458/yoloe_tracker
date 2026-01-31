@@ -783,7 +783,19 @@ class YOLOeVPIoUTracker(BaseTracker):
             # ========================================
             # VP Detection (знаходження кандидатів)
             # ========================================
+            use_vpe = False
             if self.aggregated_vpe is not None:
+                # Validate shape before using
+                if self.verbose:
+                    print(f"   🔍 Aggregated VPE shape: {self.aggregated_vpe.shape}")
+
+                if self.aggregated_vpe.dim() == 2 and self.aggregated_vpe.size(0) == 1:
+                    use_vpe = True
+                else:
+                    if self.verbose:
+                        print(f"   ⚠️  Invalid aggregated VPE shape: {self.aggregated_vpe.shape}, falling back to visual prompts")
+
+            if use_vpe:
                 # Використати агрегований VPE
                 self.model.is_fused = lambda: False
                 self.model.set_classes(["0"], self.aggregated_vpe)
