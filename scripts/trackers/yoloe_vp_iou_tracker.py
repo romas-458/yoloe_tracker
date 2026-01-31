@@ -623,7 +623,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             # Зібрати перший VPE
             if self.verbose:
                 print(f"🔄 Кадр 1: Збір VPE [INIT] (VPE=1/{self.max_vpe})")
-            self._collect_vpe(image, self.current_bbox)
+            self._collect_vpe(image, self.current_bbox, box_conf)
 
             # Ініціалізація Калман фільтру якщо увімкнено
             if self.use_kalman:
@@ -885,6 +885,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                 # Допускаємо зміну розміру в діапазоні 0.5-2.0 (50%-200%)
                 size_valid = (0.5 <= size_ratio_w <= 2.0) and (0.5 <= size_ratio_h <= 2.0)
+                size_valid = (0.3 <= size_ratio_w <= 2.5) and (0.3 <= size_ratio_h <= 2.5)
 
                 # Зберегти інформацію про кандидата
                 all_candidates_info.append({
@@ -966,6 +967,11 @@ class YOLOeVPIoUTracker(BaseTracker):
                     hybrid_scores = samurai_info.get('hybrid_scores', iou_scores)
                     best_idx_samurai = samurai_info.get('best_idx', np.argmax(hybrid_scores))
 
+                    # Зберегти conf від best боксу SAMURAI для VPE collection
+                    box_conf = 0.0  # Default
+                    if best_idx_samurai < len(boxes):
+                        best_box = boxes[best_idx_samurai]
+                        box_conf = float(best_box.conf[0].cpu().numpy())
 
                     if len(iou_scores) > 0:
                         sorted_indices = np.argsort(hybrid_scores)[::-1]
@@ -973,7 +979,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                             if idx < len(boxes):
                                 box = boxes[idx]
                                 box_xyxy = box.xyxy[0].cpu().numpy()
-                                box_conf = float(box.conf[0].cpu().numpy())
+                                curr_box_conf = float(box.conf[0].cpu().numpy())
                                 x1, y1, x2, y2 = box_xyxy
                                 is_best = (idx == best_idx_samurai)
                                 self.top_candidates.append({
@@ -981,7 +987,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                                     'iou': float(iou_scores[idx]),
                                     'affinity': float(affinity_scores[idx]),
                                     'hybrid': float(hybrid_scores[idx]),
-                                    'conf': box_conf,
+                                    'conf': curr_box_conf,
                                     'is_best_match': is_best,
                                     'type': 'samurai'
                                 })
@@ -1027,7 +1033,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                             pending_msg = " (pending)" if self.vpe_pending else ""
                             warmup_msg = " [WARMUP]" if self.in_warmup else ""
                             print(f"🔄 Кадр {self.frame_count}: Збір VPE{warmup_msg}{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                        self._collect_vpe(image, self.current_bbox)
+                        self._collect_vpe(image, self.current_bbox, box_conf)
                         if self.in_warmup:
                             self.warmup_vpe_collected += 1
                         self.vpe_pending = False  # Зібрано, скинути флаг
@@ -1118,7 +1124,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                                 if self.verbose:
                                     pending_msg = " (pending)" if self.vpe_pending else ""
                                     print(f"🔄 Кадр {self.frame_count}: Збір VPE{pending_msg} (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                                self._collect_vpe(image, self.current_bbox)
+                                self._collect_vpe(image, self.current_bbox, box_conf)
                                 self.vpe_pending = False
                             else:
                                 self.vpe_pending = True
@@ -1178,7 +1184,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                         if box_conf >= current_vpe_threshold:
                             if self.verbose:
                                 print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                            self._collect_vpe(image, self.current_bbox)
+                            self._collect_vpe(image, self.current_bbox, box_conf)
                             self.vpe_pending = False
                         else:
                             self.vpe_pending = True
@@ -1275,7 +1281,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                         if box_conf >= current_vpe_threshold:
                             if self.verbose:
                                 print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                            self._collect_vpe(image, self.current_bbox)
+                            self._collect_vpe(image, self.current_bbox, box_conf)
                             self.vpe_pending = False  # VPE зібрано
                         else:
                             self.vpe_pending = True  # Встановити флаг для наступних кадрів
@@ -1375,7 +1381,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
                                     print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                                self._collect_vpe(image, self.current_bbox)
+                                self._collect_vpe(image, self.current_bbox, box_conf)
                                 self.vpe_pending = False  # VPE зібрано
                             else:
                                 self.vpe_pending = True  # Встановити флаг для наступних кадрів
@@ -1424,7 +1430,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                             if box_conf >= current_vpe_threshold:
                                 if self.verbose:
                                     print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                                self._collect_vpe(image, self.current_bbox)
+                                self._collect_vpe(image, self.current_bbox, box_conf)
                                 self.vpe_pending = False  # VPE зібрано
                             else:
                                 self.vpe_pending = True  # Встановити флаг для наступних кадрів
@@ -1444,13 +1450,14 @@ class YOLOeVPIoUTracker(BaseTracker):
                 print(f"❌ Помилка update: {e}")
             return False, None
 
-    def _collect_vpe(self, image: np.ndarray, bbox: list):
+    def _collect_vpe(self, image: np.ndarray, bbox: list, conf: float = 0.5):
         """
         Зібрати VPE з поточного кадру
 
         Args:
             image: Поточний кадр
             bbox: Bbox [x1, y1, x2, y2]
+            conf: Detection confidence для VPE quality assessment [0-1]
         """
         try:
             # Створити visual prompts (завжди використовуємо cls=0 для VP моделей)
@@ -1486,14 +1493,12 @@ class YOLOeVPIoUTracker(BaseTracker):
 
             # Додати до dual memory або simple deque
             if self.use_dual_memory_vpe:
-                # Get confidence from bbox (should be passed separately, but using default for now)
-                # In real usage, conf should be passed as parameter to _collect_vpe
-                conf = 0.8  # Placeholder - should be passed from detection
+                # Використовувати conf від detection (SAMURAI affinity або detection conf)
                 self.dual_memory.add_vpe(vpe, conf, self.frame_count)
 
                 if self.verbose:
                     stats = self.dual_memory.get_stats()
-                    print(f"   📥 Зібрано VPE: {self.dual_memory}")
+                    print(f"   📥 Зібрано VPE (conf={conf:.3f}): {self.dual_memory}")
             else:
                 self.vpe_list.append(vpe)
                 if self.verbose:
