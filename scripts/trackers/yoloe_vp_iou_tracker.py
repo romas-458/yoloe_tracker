@@ -457,10 +457,10 @@ class YOLOeVPIoUTracker(BaseTracker):
 
         if self.use_samurai_kalman and self.verbose:
             print(f"✨ SAMURAI Kalman режим активований:")
-            print(f"   α_kf={self.kalman_alpha_kf} (motion вага)")
-            print(f"   τ_kf={self.kalman_tau_kf} (stability gate поріг)")
-            print(f"   N_max={self.kalman_n_max} (memory bank розмір)")
-            print(f"   hybrid_conf_weight={self.hybrid_conf_weight} (вага conf в гібридній оцінці: IoU={1-self.hybrid_conf_weight:.1%}, conf={self.hybrid_conf_weight:.1%})")
+            print(f"   α_kf={self.kalman_alpha_kf} ✓ (motion вага в Eq.7: IoU={self.kalman_alpha_kf:.1%}, affinity={(1-self.kalman_alpha_kf):.1%})")
+            print(f"   τ_kf={self.kalman_tau_kf} ✓ (stability gate поріг для motion confidence)")
+            print(f"   N_max={self.kalman_n_max} (memory bank розмір - на даний момент не реалізовано)")
+            print(f"   hybrid_conf_weight={self.hybrid_conf_weight} (вага conf при збиранні VPE)")
 
         # Ініціалізація моделі
         if self.verbose:
@@ -681,12 +681,13 @@ class YOLOeVPIoUTracker(BaseTracker):
                 # На даний момент використовуємо conf як наближення affinity
                 affinity_scores = np.array([d['conf'] for d in all_detections])
 
-                # Phase 2: Обчислити гібридну оцінку (Equation 7)
-                # hybrid_conf_weight контролює вагу conf (affinity) в гібридній оцінці
-                # Більш висока вага = більше довірятися conf, менше IoU
+                # Phase 2: Обчислити гібридну оцінку (Equation 7 з SAMURAI)
+                # M* = argmax_i(α_kf · s_kf(M_i) + (1-α_kf) · s_mask(M_i))
+                # α_kf = 0.15 означає: IoU отримує 15%, affinity отримує 85%
+                # (на відміну від hybrid_conf_weight який контролює VPE conf при збиранні)
                 hybrid_scores = (
-                    (1 - self.hybrid_conf_weight) * iou_scores +
-                    self.hybrid_conf_weight * affinity_scores
+                    self.kalman_alpha_kf * iou_scores +
+                    (1 - self.kalman_alpha_kf) * affinity_scores
                 )
 
                 # Визначити чи було успішне оновлення
