@@ -368,6 +368,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                  reinit_diou_max: float = -0.9,
                  reinit_adaptive_rate: int = 15,
                  reinit_conf_threshold: float = 1.0,
+                 phase3_redetection_validation_frames: int = 3,
                  use_kalman: bool = False,
                  kalman_process_noise: float = 0.01,
                  kalman_measurement_noise: float = 10.0,
@@ -389,6 +390,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                  dual_use_anchor: bool = True,
                  dual_anchor_weight: float = 0.1,
                  verbose: bool = False,
+                 debug_frame_step: int = 1,
                  **kwargs):
         super().__init__(**kwargs)
 
@@ -424,6 +426,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.reinit_diou_max = reinit_diou_max
         self.reinit_adaptive_rate = reinit_adaptive_rate
         self.reinit_conf_threshold = reinit_conf_threshold
+        self.phase3_redetection_validation_frames = phase3_redetection_validation_frames
         self.use_kalman = use_kalman
         self.kalman_process_noise = kalman_process_noise
         self.kalman_measurement_noise = kalman_measurement_noise
@@ -445,6 +448,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.dual_use_anchor = dual_use_anchor
         self.dual_anchor_weight = dual_anchor_weight
         self.verbose = verbose
+        self.debug_frame_step = debug_frame_step
 
         # Kalman filter (опціональний)
         self.kalman = None
@@ -516,6 +520,13 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.search_candidates = []  # Всі detections під час Phase 2/3 для візуалізації
         self.top_candidates = []  # Top candidates з IoU scores у Phase 1 для візуалізації
         self.last_bbox_is_kalman_only = False  # Чи є поточний bbox тільки від Калмана (не валідовано детекціями)
+        self.current_frame_detections = []  # Всі детекції з proximity інформацією на поточному кадрі
+        self.selected_detection_idx = None  # Індекс вибраної детекції в Phase 1
+
+        # Phase 3 Redetection Validation Gate
+        self.in_phase3_validation = False  # Чи ми в режимі validation після Phase 3 реініціалізації
+        self.phase3_validation_consecutive_successes = 0  # Лічильник послідовних успішних фреймів у validation режимі
+        self.phase3_validation_bbox = None  # Bbox що перевіряється у validation режимі
 
         if self.verbose:
             # Conf adaptive info
@@ -558,6 +569,9 @@ class YOLOeVPIoUTracker(BaseTracker):
             else:
                 reinit_conf_msg = ""
 
+            # Phase 3 Validation info
+            phase3_validation_msg = f", phase3_validation={phase3_redetection_validation_frames}fr"
+
             # Warmup info
             warmup_msg = f", warmup={warmup_frames}fr (IoU>={warmup_vpe_iou_threshold})"
 
@@ -567,7 +581,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             else:
                 kalman_msg = ""
 
-            print(f"✅ YOLOe-VP-IoU готовий (vpe_step={vpe_step}, max_vpe={max_vpe}, iou_threshold={iou_threshold}, max_lost_frames={max_lost_frames}{conf_msg}{vpe_conf_msg}{warmup_msg}{phase2_msg}{waiting_reinit_msg}{reinit_msg}{reinit_conf_msg}{kalman_msg})")
+            print(f"✅ YOLOe-VP-IoU готовий (vpe_step={vpe_step}, max_vpe={max_vpe}, iou_threshold={iou_threshold}, max_lost_frames={max_lost_frames}{conf_msg}{vpe_conf_msg}{warmup_msg}{phase2_msg}{waiting_reinit_msg}{reinit_msg}{reinit_conf_msg}{phase3_validation_msg}{kalman_msg})")
 
     @classmethod
     def get_name(cls) -> str:
@@ -593,10 +607,13 @@ class YOLOeVPIoUTracker(BaseTracker):
             'reinit_diou_threshold': -1.0,
             'reinit_diou_max': -0.9,
             'reinit_adaptive_rate': 15,
+            'reinit_conf_threshold': 1.0,
+            'phase3_redetection_validation_frames': 3,
             'use_kalman': False,
             'kalman_process_noise': 0.01,
             'kalman_measurement_noise': 10.0,
             'verbose': False,
+            'debug_frame_step': 1,
         }
 
     def initialize(self, image: np.ndarray, bbox: List[float]) -> bool:
@@ -690,6 +707,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                     (1 - self.kalman_alpha_kf) * affinity_scores
                 )
 
+                # hybrid_scores = (
+                #         (
+                #                     1 - self.hybrid_conf_weight) * iou_scores +  # ❌ Неправильний параметр
+                #         self.hybrid_conf_weight * affinity_scores
+                # )
+
                 # Визначити чи було успішне оновлення
                 best_idx = np.argmax(hybrid_scores)
                 is_successful = (iou_scores[best_idx] >= self.kalman_iou_threshold)
@@ -768,6 +791,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.top_candidates = []
         self.rejected_candidates = []
         self.search_candidates = []
+        self.current_frame_detections = []
 
         # Перевірка завершення warmup періоду
         if self.in_warmup and self.frame_count >= self.warmup_frames:
@@ -859,6 +883,10 @@ class YOLOeVPIoUTracker(BaseTracker):
                         return True, [x1, y1, x2 - x1, y2 - y1]
 
             boxes = results[0].boxes
+
+            # Ініціалізувати - розрахуємо proximity після Phase 1
+            self.current_frame_detections = []
+            self.selected_detection_idx = None
 
             # ========================================
             # Фаза 1: IoU Matching з last_valid_bbox
@@ -961,6 +989,28 @@ class YOLOeVPIoUTracker(BaseTracker):
                 self.lost_frames = 0  # Reset counter
                 self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
+                # Зберегти індекс вибраної детекції для proximity таблиці
+                self.selected_detection_idx = best_iou_idx
+
+                # Розрахувати proximity для всіх детекцій (тільки коли таблиця буде показана)
+                if self.frame_count % self.debug_frame_step == 0:
+                    self.current_frame_detections = self._get_all_detections_proximity(image, boxes, best_iou_idx)
+                    if self.verbose and len(self.current_frame_detections) > 0:
+                        print(f"   📊 Зібрано proximity для {len(self.current_frame_detections)} детекцій")
+
+                # ⭐ Phase 3 Validation Gate: лічимо послідовні успішні фрейми
+                if self.in_phase3_validation:
+                    self.phase3_validation_consecutive_successes += 1
+                    if self.verbose:
+                        print(f"   📊 Validation: успішний фрейм {self.phase3_validation_consecutive_successes}/{self.phase3_redetection_validation_frames}")
+
+                    # Якщо накопили достатня кількість послідовних успішних
+                    if self.phase3_validation_consecutive_successes >= self.phase3_redetection_validation_frames:
+                        self.in_phase3_validation = False
+                        self.phase3_validation_bbox = None
+                        if self.verbose:
+                            print(f"   ✅ Phase 3 Validation PASSED - реініціалізація підтверджена, повертаємось до Phase 1")
+
                 # Зберегти candidates для візуалізації
                 self.top_candidates = []
 
@@ -1051,6 +1101,22 @@ class YOLOeVPIoUTracker(BaseTracker):
 
             else:
                 # IoU < threshold - об'єкт не знайдено за geometric matching
+
+                # ⭐ Phase 3 Validation Gate: скасування валідації при невдачі
+                if self.in_phase3_validation:
+                    self.phase3_validation_consecutive_successes = 0  # Скинути лічильник при невдачі
+
+                    # Якщо validation тривалий час (більше validation_frames кадрів), скасуємо validation
+                    # і повертаємось до попередньої bbox
+                    if self.lost_frames >= self.phase3_redetection_validation_frames:
+                        self.in_phase3_validation = False
+                        self.phase3_validation_bbox = None
+                        if self.verbose:
+                            print(f"   ⚠️  Phase 3 Validation FAILED (lost_frames >= {self.phase3_redetection_validation_frames}) - реініціалізація скасована!")
+                            print(f"   🔄 Повертаємось до Phase 3 recovery режиму")
+                    elif self.verbose:
+                        print(f"   ❌ Phase 3 Validation: невдалий фрейм - лічильник скинутий (lost_frames={self.lost_frames})")
+
                 self.lost_frames += 1
 
                 if self.lost_frames < self.max_lost_frames:
@@ -1061,18 +1127,27 @@ class YOLOeVPIoUTracker(BaseTracker):
                     # Очистити top candidates (вони були для Phase 1)
                     self.top_candidates = []
 
-                    # Зберегти всі detections для візуалізації
+                    # Зберегти всі detections для візуалізації з інформацією про статус
                     self.search_candidates = []
                     for box in boxes:
                         box_xyxy = box.xyxy[0].cpu().numpy()
                         box_conf = float(box.conf[0].cpu().numpy())
                         x1, y1, x2, y2 = box_xyxy
                         diou = self._compute_diou(self.last_valid_bbox, box_xyxy) if self.last_valid_bbox else -float('inf')
+
+                        # Визначити статус для кожного候選
+                        status = 'rejected'  # Default
+                        if diou >= self.phase2_diou_threshold:
+                            status = 'accepted'  # DIoU match
+                        elif box_conf >= self.waiting_reinit_conf_threshold and diou >= self.waiting_reinit_diou_threshold:
+                            status = 'accepted'  # Early reinit
+
                         self.search_candidates.append({
                             'bbox': [x1, y1, x2 - x1, y2 - y1],
                             'conf': box_conf,
                             'diou': diou,
-                            'phase': 2
+                            'phase': 2,
+                            'status': status
                         })
 
                     # Спробувати DIoU matching якщо увімкнено
@@ -1108,6 +1183,34 @@ class YOLOeVPIoUTracker(BaseTracker):
                         self.lost_frames = 0  # Reset counter
                         self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
                         self.search_candidates = []  # Очистити кандидатів (Phase 2 - знайдено)
+
+                        # ⭐ Заповнити top_candidates для візуалізації на першому фреймі після відновлення
+                        self.top_candidates = []
+                        for idx, box in enumerate(boxes):
+                            box_xyxy_tmp = box.xyxy[0].cpu().numpy()
+                            curr_box_conf = float(box.conf[0].cpu().numpy())
+                            diou_val = self._compute_diou(self.last_valid_bbox, box_xyxy_tmp)
+                            x1, y1, x2, y2 = box_xyxy_tmp
+                            is_best = (idx == phase2_diou_idx)
+
+                            # Визначити статус кандидата
+                            status = 'rejected'
+                            if diou_val >= self.phase2_diou_threshold:
+                                status = 'accepted'
+                            elif curr_box_conf >= self.waiting_reinit_conf_threshold and diou_val >= self.waiting_reinit_diou_threshold:
+                                status = 'accepted'
+
+                            self.top_candidates.append({
+                                'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                'iou': diou_val,  # For Phase 2, use DIoU as IoU score
+                                'diou': diou_val,
+                                'conf': curr_box_conf,
+                                'is_best_match': is_best,
+                                'size_valid': True,
+                                'type': 'phase2',
+                                'phase': 2,
+                                'status': status
+                            })
 
                         if self.verbose:
                             kalman_suffix = " + Kalman" if self.use_kalman else ""
@@ -1174,6 +1277,32 @@ class YOLOeVPIoUTracker(BaseTracker):
                         self.last_valid_bbox = self.current_bbox
                         self.lost_frames = 0  # Reset counter
 
+                        # ⭐ Заповнити top_candidates для візуалізації на першому фреймі після відновлення
+                        self.top_candidates = []
+                        for idx, box in enumerate(boxes):
+                            box_xyxy_tmp = box.xyxy[0].cpu().numpy()
+                            curr_box_conf = float(box.conf[0].cpu().numpy())
+                            diou_val = self._compute_diou(self.last_valid_bbox, box_xyxy_tmp)
+                            x1, y1, x2, y2 = box_xyxy_tmp
+                            is_best = (idx == waiting_reinit_idx)
+
+                            # Визначити статус кандидата
+                            status = 'rejected'
+                            if curr_box_conf >= self.waiting_reinit_conf_threshold and diou_val >= self.waiting_reinit_diou_threshold:
+                                status = 'accepted'
+
+                            self.top_candidates.append({
+                                'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                'iou': diou_val,
+                                'diou': diou_val,
+                                'conf': curr_box_conf,
+                                'is_best_match': is_best,
+                                'size_valid': True,
+                                'type': 'phase2',
+                                'phase': 2,
+                                'status': status
+                            })
+
                         if self.verbose:
                             kalman_suffix = " + Kalman" if self.use_kalman else ""
                             print(f"🔄 Кадр {self.frame_count}: [PHASE 2] Early Reinit{kalman_suffix} (conf={box_conf:.3f} >= {self.waiting_reinit_conf_threshold}, DIoU={waiting_reinit_diou:.3f} >= {self.waiting_reinit_diou_threshold})")
@@ -1225,18 +1354,30 @@ class YOLOeVPIoUTracker(BaseTracker):
                     # Очистити попередні відкинуті кандидати
                     self.rejected_candidates = []
 
-                    # Зберегти всі detections для візуалізації
+                    # Обчислити адаптивний DIoU поріг для Phase 3
+                    phase3_current_threshold = self._get_adaptive_diou_threshold()
+
+                    # Зберегти всі detections для візуалізації з інформацією про статус
                     self.search_candidates = []
                     for box in boxes:
                         box_xyxy = box.xyxy[0].cpu().numpy()
                         box_conf = float(box.conf[0].cpu().numpy())
                         x1, y1, x2, y2 = box_xyxy
                         diou = self._compute_diou(self.last_valid_bbox, box_xyxy) if self.last_valid_bbox else -float('inf')
+
+                        # Визначити статус для кожного кандидата
+                        status = 'rejected'  # Default
+                        if box_conf >= self.reinit_conf_threshold:
+                            status = 'accepted'  # High-conf reinit
+                        elif diou >= phase3_current_threshold:
+                            status = 'accepted'  # DIoU-based reinit
+
                         self.search_candidates.append({
                             'bbox': [x1, y1, x2 - x1, y2 - y1],
                             'conf': box_conf,
                             'diou': diou,
-                            'phase': 3
+                            'phase': 3,
+                            'status': status
                         })
 
                     # Спочатку перевіряємо чи є детекція з високою conf (автоматична реініціалізація)
@@ -1271,9 +1412,41 @@ class YOLOeVPIoUTracker(BaseTracker):
                         self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
                         self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
 
+                        # ⭐ Заповнити top_candidates для візуалізації на першому фреймі після відновлення
+                        self.top_candidates = []
+                        for idx, box in enumerate(boxes):
+                            box_xyxy_tmp = box.xyxy[0].cpu().numpy()
+                            curr_box_conf = float(box.conf[0].cpu().numpy())
+                            diou_val = self._compute_diou(self.last_valid_bbox, box_xyxy_tmp)
+                            x1, y1, x2, y2 = box_xyxy_tmp
+                            is_best = (idx == high_conf_candidate_idx)
+
+                            # Визначити статус кандидата
+                            status = 'rejected'
+                            if curr_box_conf >= self.reinit_conf_threshold:
+                                status = 'accepted'
+
+                            self.top_candidates.append({
+                                'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                'iou': diou_val,
+                                'diou': diou_val,
+                                'conf': curr_box_conf,
+                                'is_best_match': is_best,
+                                'size_valid': True,
+                                'type': 'phase3',
+                                'phase': 3,
+                                'status': status
+                            })
+
+                        # ⭐ Входимо у Phase 3 Validation режим
+                        self.in_phase3_validation = True
+                        self.phase3_validation_consecutive_successes = 0
+                        self.phase3_validation_bbox = self.current_bbox.copy()
+
                         if self.verbose:
                             kalman_suffix = " + Kalman" if self.use_kalman else ""
                             print(f"🔄 Кадр {self.frame_count}: [PHASE 3] High-Conf Re-ID{kalman_suffix} (conf={box_conf:.3f} >= {self.reinit_conf_threshold})")
+                            print(f"   📊 Validation gate активована (потрібно {self.phase3_redetection_validation_frames} послідовних успішних фреймів)")
 
                         # Зібрати VPE для нового bbox (якщо conf достатня)
                         # Під час warmup використовувати мінімальний поріг
@@ -1371,9 +1544,43 @@ class YOLOeVPIoUTracker(BaseTracker):
                             self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
                             self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
 
+                            # ⭐ Заповнити top_candidates для візуалізації на першому фреймі після відновлення
+                            self.top_candidates = []
+                            for idx, box in enumerate(boxes):
+                                box_xyxy_tmp = box.xyxy[0].cpu().numpy()
+                                curr_box_conf = float(box.conf[0].cpu().numpy())
+                                diou_val = self._compute_diou(self.last_valid_bbox, box_xyxy_tmp)
+                                x1, y1, x2, y2 = box_xyxy_tmp
+                                is_best = (idx == reinit_candidate_idx)
+
+                                # Визначити статус кандидата
+                                status = 'rejected'
+                                if curr_box_conf >= self.reinit_conf_threshold:
+                                    status = 'accepted'
+                                elif diou_val >= current_threshold:
+                                    status = 'accepted'
+
+                                self.top_candidates.append({
+                                    'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                    'iou': diou_val,
+                                    'diou': diou_val,
+                                    'conf': curr_box_conf,
+                                    'is_best_match': is_best,
+                                    'size_valid': True,
+                                    'type': 'phase3',
+                                    'phase': 3,
+                                    'status': status
+                                })
+
+                            # ⭐ Входимо у Phase 3 Validation режим
+                            self.in_phase3_validation = True
+                            self.phase3_validation_consecutive_successes = 0
+                            self.phase3_validation_bbox = self.current_bbox.copy()
+
                             if self.verbose:
                                 kalman_suffix = " + Kalman" if self.use_kalman else ""
                                 print(f"🔄 Кадр {self.frame_count}: [PHASE 3] Re-ID{kalman_suffix} (conf={box_conf:.3f}, DIoU={reinit_candidate_diou:.3f} >= {current_threshold:.3f})")
+                                print(f"   📊 Validation gate активована (потрібно {self.phase3_redetection_validation_frames} послідовних успішних фреймів)")
 
                             # Зібрати VPE для нового bbox (якщо conf достатня)
                             # Під час warmup використовувати мінімальний поріг
@@ -1783,12 +1990,239 @@ class YOLOeVPIoUTracker(BaseTracker):
 
         return info
 
+    def _calculate_cosine_similarity(self, vpe1: torch.Tensor, vpe2: torch.Tensor) -> float:
+        """
+        Розрахувати cosine similarity між двома VPE векторами
+
+        Args:
+            vpe1: VPE tensor [1, 1, D] або [1, D]
+            vpe2: VPE tensor [1, 1, D] або [1, D]
+
+        Returns:
+            Cosine similarity від 0 до 1
+        """
+        try:
+            if vpe1 is None or vpe2 is None:
+                return 0.0
+
+            # Перевірити що це тензори, а не tuple/list
+            if not isinstance(vpe1, torch.Tensor) or not isinstance(vpe2, torch.Tensor):
+                if self.verbose:
+                    print(f"   ⚠️  VPE має неправильний тип: vpe1={type(vpe1).__name__}, vpe2={type(vpe2).__name__}")
+                return 0.0
+
+            # Flatten до [D]
+            v1 = vpe1.flatten()
+            v2 = vpe2.flatten()
+
+            # Cosine similarity
+            similarity = F.cosine_similarity(v1.unsqueeze(0), v2.unsqueeze(0))
+            # Масштабувати від [-1, 1] до [0, 1]
+            return ((similarity.item() + 1) / 2)
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  Помилка при розрахунку cosine similarity: {e}")
+            return 0.0
+
+    def _get_all_detections_proximity(self, image: np.ndarray, boxes, tracked_idx: int = None) -> List[Dict]:
+        """
+        Отримати інформацію про top-7 детекції з proximity до anchor/LT/ST
+        Завжди включає tracked об'єкт, навіть якщо він не в top-7 по конфіденції
+
+        Args:
+            image: Поточний кадр
+            boxes: Детекції з YOLOE
+            tracked_idx: Індекс вибраної детекції (той що відстежується)
+
+        Returns:
+            Список з інформацією про детекції + proximity (tracked завжди перший)
+        """
+        if self.lost_frames > 0 or len(boxes) == 0 or not self.use_dual_memory_vpe or self.dual_memory is None:
+            return []
+
+        try:
+            # Отримати reference VPE
+            anchor_vpe = self.dual_memory.get_anchor_vpe()
+            lt_avg_vpe = self.dual_memory.get_long_term_avg_vpe()
+            st_avg_vpe = self.dual_memory.get_short_term_avg_vpe()
+
+            # Якщо немає ніяких embedding'ів, не розраховувати
+            if anchor_vpe is None and lt_avg_vpe is None and st_avg_vpe is None:
+                return []
+
+            detections_info = []
+
+            # Top-7 детекцій по конфіденції
+            box_list = list(boxes)
+            box_list_sorted = sorted(
+                enumerate(box_list),
+                key=lambda x: float(x[1].conf[0].cpu().numpy()),
+                reverse=True
+            )[:7]
+
+            # Зібрати індекси з топ-7
+            top_indices = set(idx for idx, _ in box_list_sorted)
+
+            # Якщо tracked_idx не в топ-7, додати його
+            indices_to_process = box_list_sorted[:]
+            if tracked_idx is not None and tracked_idx not in top_indices:
+                if tracked_idx < len(box_list):
+                    indices_to_process.append((tracked_idx, box_list[tracked_idx]))
+                    if self.verbose:
+                        print(f"   📌 Tracked об'єкт (idx={tracked_idx}) не в топ-7 по conf, додано окремо")
+
+            for orig_idx, box in indices_to_process:
+                try:
+                    box_xyxy = box.xyxy[0].cpu().numpy()
+                    box_conf = float(box.conf[0].cpu().numpy())
+
+                    # Обчислити IoU з last_valid_bbox
+                    iou = self._compute_iou(self.last_valid_bbox, box_xyxy)
+
+                    # Обчислити размір
+                    last_valid_w = self.last_valid_bbox[2] - self.last_valid_bbox[0]
+                    last_valid_h = self.last_valid_bbox[3] - self.last_valid_bbox[1]
+                    box_w = box_xyxy[2] - box_xyxy[0]
+                    box_h = box_xyxy[3] - box_xyxy[1]
+
+                    size_ratio_w = box_w / (last_valid_w + 1e-6)
+                    size_ratio_h = box_h / (last_valid_h + 1e-6)
+
+                    # Отримати VPE для цієї детекції (окремий predict)
+                    anchor_prox = None
+                    lt_prox = None
+                    st_prox = None
+
+                    try:
+                        visual_prompts = dict(
+                            bboxes=np.array([box_xyxy]),
+                            cls=np.array([0]),
+                        )
+
+                        # Використовуємо той самий підхід що і в _collect_vpe
+                        current_conf = self._get_adaptive_conf()
+                        results = self.model.predict(
+                            image,
+                            visual_prompts=visual_prompts,
+                            predictor=YOLOEVPSegPredictor,
+                            conf=current_conf,
+                            imgsz=self.imgsz,
+                            device=self.device,
+                            verbose=False,
+                        )
+
+                        # Отримати VPE через predictor (як в _collect_vpe)
+                        self.model.predictor.set_prompts(visual_prompts)
+                        det_vpe = self.model.predictor.get_vpe(image)
+
+                        if det_vpe is not None:
+                            if self.verbose:
+                                print(f"      🔍 Det {orig_idx}: VPE shape: {det_vpe.shape}")
+
+                            # Обчислити proximity
+                            anchor_prox = self._calculate_cosine_similarity(anchor_vpe, det_vpe) if anchor_vpe is not None else None
+                            lt_prox = self._calculate_cosine_similarity(lt_avg_vpe, det_vpe) if lt_avg_vpe is not None else None
+                            st_prox = self._calculate_cosine_similarity(st_avg_vpe, det_vpe) if st_avg_vpe is not None else None
+                        elif self.verbose:
+                            print(f"      ⚠️  Det {orig_idx}: VPE is None")
+
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"      ⚠️  Det {orig_idx}: помилка VPE - {e}")
+
+                    detection_info = {
+                        'idx': orig_idx,
+                        'conf': box_conf,
+                        'iou': iou,
+                        'size_w': size_ratio_w,
+                        'size_h': size_ratio_h,
+                        'anchor_proximity': anchor_prox,
+                        'lt_proximity': lt_prox,
+                        'st_proximity': st_prox,
+                        'bbox': box_xyxy.tolist(),
+                        'vpe': det_vpe,  # Зберегти VPE для подальшого використання
+                    }
+                    detections_info.append(detection_info)
+
+                except Exception as e:
+                    continue
+
+            if self.verbose and len(detections_info) > 0:
+                print(f"   📊 Зібрано proximity для {len(detections_info)} детекцій")
+
+            # Відсортувати так, щоб tracked об'єкт був першим
+            if tracked_idx is not None:
+                detections_info.sort(key=lambda x: (x['idx'] != tracked_idx, -x['conf']))
+            else:
+                # Якщо tracked_idx не заданий, сортувати по конфіденції
+                detections_info.sort(key=lambda x: -x['conf'])
+
+            return detections_info
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  Помилка при обчисленні proximity детекцій: {e}")
+            return []
+
+    def _get_proximity_info(self) -> Optional[Dict[str, Any]]:
+        """
+        Отримати інформацію про proximity до anchor та memory для Phase 1
+
+        Returns:
+            Dict з proximity даними для debug таблиці або None
+        """
+        if not self.use_dual_memory_vpe or self.dual_memory is None or self.lost_frames > 0:
+            return None
+
+        try:
+            anchor_vpe = self.dual_memory.get_anchor_vpe()
+            lt_avg_vpe = self.dual_memory.get_long_term_avg_vpe()
+            st_avg_vpe = self.dual_memory.get_short_term_avg_vpe()
+
+            # Якщо немає ніяких embedding'ів, не показувати таблицю
+            if anchor_vpe is None and lt_avg_vpe is None and st_avg_vpe is None:
+                return None
+
+            metadata = self.dual_memory.get_vpe_metadata()
+
+            # Знайти VPE вибраної детекції (той що відстежується зараз)
+            current_vpe = None
+            if self.selected_detection_idx is not None and len(self.current_frame_detections) > 0:
+                # Знайти детекцію з відповідним індексом
+                for det in self.current_frame_detections:
+                    if det.get('idx') == self.selected_detection_idx:
+                        # Отримати збережений VPE для цієї детекції
+                        current_vpe = det.get('vpe')
+                        if self.verbose and current_vpe is not None:
+                            print(f"   📊 Використано VPE вибраної детекції (idx={self.selected_detection_idx}) для proximity")
+                        break
+
+            # Fallback до aggregated_vpe якщо не знайдено
+            if current_vpe is None:
+                current_vpe = self.aggregated_vpe
+                if self.verbose:
+                    print(f"   ⚠️  VPE вибраної детекції не знайдено, використано aggregated_vpe")
+
+            proximity = {
+                'anchor_proximity': self._calculate_cosine_similarity(anchor_vpe, current_vpe) if anchor_vpe is not None else None,
+                'lt_proximity': self._calculate_cosine_similarity(lt_avg_vpe, current_vpe) if lt_avg_vpe is not None else None,
+                'st_proximity': self._calculate_cosine_similarity(st_avg_vpe, current_vpe) if st_avg_vpe is not None else None,
+                'metadata': metadata,
+                'detections': self.current_frame_detections,  # Додати proximity для всіх детекцій
+                'selected_detection_idx': self.selected_detection_idx,  # Додати індекс вибраної детекції
+            }
+
+            return proximity
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  Помилка при розрахунку proximity info: {e}")
+            return None
+
     def get_debug_info(self) -> Dict[str, Any]:
         """
         Отримати debug інформацію для візуалізації
 
         Returns:
-            Dict з інформацією про стан трекера
+            Dict з інформацією про стан трекера та proximity до memory
         """
         # Визначити поточну фазу
         if self.lost_frames == 0:
@@ -1798,7 +2232,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         else:
             phase = "PHASE 3: Re-Identification"
 
-        return {
+        debug_info = {
             'num_vpe': self._get_vpe_count(),
             'max_vpe': self.max_vpe,
             'vpe_step': self.vpe_step,
@@ -1813,6 +2247,26 @@ class YOLOeVPIoUTracker(BaseTracker):
             'use_kalman': self.use_kalman,
             'kalman_active': self.kalman is not None,
         }
+
+        # Додати proximity інформацію для Phase 1 з контролем частоти
+        debug_info['debug_frame_step'] = self.debug_frame_step
+        debug_info['should_show_by_step'] = (self.frame_count % self.debug_frame_step == 0)
+
+        if self.lost_frames == 0 and self.frame_count % self.debug_frame_step == 0:
+            proximity_info = self._get_proximity_info()
+            if proximity_info is not None:
+                debug_info['proximity_info'] = proximity_info
+                debug_info['show_proximity_table'] = True
+                if self.verbose:
+                    print(f"   📊 Debug table буде показана (frame={self.frame_count}, step={self.debug_frame_step})")
+            else:
+                debug_info['show_proximity_table'] = False
+                if self.verbose:
+                    print(f"   ℹ️  proximity_info is None (frame={self.frame_count})")
+        else:
+            debug_info['show_proximity_table'] = False
+
+        return debug_info
 
 
 if __name__ == '__main__':
