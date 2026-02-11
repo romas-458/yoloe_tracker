@@ -9,6 +9,7 @@ Trackers module - модульна система трекерів
 
 from .base_tracker import BaseTracker, TrackerRegistry
 from .yoloe_vp_iou_tracker import YOLOeVPIoUTracker
+from .yoloe_class_reinit_tracker import YOLOeClassReinitTracker
 from .opencv_trackers import (
     KCFTracker,
     CSRTTracker,
@@ -19,8 +20,9 @@ from .opencv_trackers import (
 # Автоматична реєстрація трекерів
 __all__ = [
     'BaseTracker',
-    'TrackerRegistry',  
+    'TrackerRegistry',
     'YOLOeVPIoUTracker',
+    'YOLOeClassReinitTracker',
     'KCFTracker',
     'CSRTTracker',
     'MedianFlowTracker',
