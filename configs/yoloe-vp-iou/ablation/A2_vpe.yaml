@@ -32,8 +32,8 @@ max_lost_frames: 15
 warmup_frames: 0
 warmup_vpe_iou_threshold: 0.5
 
-# Phase 2 - тільки IoU
-phase2_diou_threshold: 1.0
+# Phase 2 - VPE search УВІМКНЕНО
+phase2_diou_threshold: 0.5      # Пошук з VPE через IoU
 
 # Waiting reinit вимкнено
 waiting_reinit_conf_threshold: 1.0
@@ -53,5 +53,5 @@ use_samurai_kalman: false
 # ❌ DUAL MEMORY ВИМКНЕНО
 use_dual_memory_vpe: false
 
-verbose: false
-debug_frame_step: 100
+verbose: true
+debug_frame_step: 10
