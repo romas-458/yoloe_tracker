@@ -1,6 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Ablation Study Runner for YOLOe-VP-IoU Tracker
 # Runs all ablation experiments A1-A8 on the test set
+# Compatible with both bash and sh
 
 DATASET_PATH="/home/roman/Projects/phd/myric/data"
 TEST_LIST="lasot_ablation_test_list_short.txt"
@@ -17,20 +18,16 @@ echo ""
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Array of ablation configs (без префіксу configs/ - він додається автоматично)
-configs=(
-    "yoloe-vp-iou/ablation/A1_baseline.yaml"
-    "yoloe-vp-iou/ablation/A2_vpe.yaml"
-    "yoloe-vp-iou/ablation/A3_kalman.yaml"
-    "yoloe-vp-iou/ablation/A4_vpe_kalman.yaml"
-    "yoloe-vp-iou/ablation/A5_diou.yaml"
-    "yoloe-vp-iou/ablation/A6_adaptive.yaml"
-    "yoloe-vp-iou/ablation/A7_dual_memory.yaml"
-    "yoloe-vp-iou/ablation/A8_full.yaml"
-)
-
-# Run each experiment
-for config in "${configs[@]}"; do
+# List of ablation configs (POSIX-compatible, no arrays)
+# Loop through all A*.yaml files in order
+for config in yoloe-vp-iou/ablation/A1_baseline.yaml \
+              yoloe-vp-iou/ablation/A2_vpe.yaml \
+              yoloe-vp-iou/ablation/A3_kalman.yaml \
+              yoloe-vp-iou/ablation/A4_vpe_kalman.yaml \
+              yoloe-vp-iou/ablation/A5_diou.yaml \
+              yoloe-vp-iou/ablation/A6_adaptive.yaml \
+              yoloe-vp-iou/ablation/A7_dual_memory.yaml \
+              yoloe-vp-iou/ablation/A8_full.yaml; do
     # Extract experiment name (A1, A2, etc.)
     exp_name=$(basename "$config" .yaml)
 
