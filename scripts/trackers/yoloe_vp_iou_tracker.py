@@ -826,7 +826,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             if use_vpe:
                 # Використати агрегований VPE
                 self.model.is_fused = lambda: False
-                self.model.set_classes(["0"], self.aggregated_vpe)
+                self.model.set_classes([0], self.aggregated_vpe)  # Use int instead of string
 
                 current_conf = self._get_adaptive_conf()
                 results = self.model.predict(
