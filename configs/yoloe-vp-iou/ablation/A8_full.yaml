@@ -1,0 +1,59 @@
+# A8: Full - повна конфігурація з усіма оптимізованими features
+name: "A8 Full"
+description: "Complete YOLOe-VP-IoU with all features optimized"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "A8"
+version: "1.0"
+
+model_path: "yoloe-v8s-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# ✅ ADAPTIVE CONFIDENCE - оптимізовано
+conf: 0.01
+conf_max: 0.15                    # Підвищено для кращої детекції
+conf_adaptive_rate: 25            # Швидша адаптація
+iou_threshold: 0.2
+
+# ✅ VPE - оптимізовано
+vpe_step: 10
+max_vpe: 50
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.25                # Підвищено для адаптивності
+adaptive_rate: 400                # Швидша VPE адаптація
+
+max_lost_frames: 20               # Більше tolerance
+warmup_frames: 0                  # Warmup вимкнено
+
+# ✅ Phase 2 DIoU - оптимізовано
+phase2_diou_threshold: -0.1       # Більш толерантний
+waiting_reinit_conf_threshold: 0.35
+waiting_reinit_diou_threshold: -0.6
+
+# ✅ Phase 3 DIoU - оптимізовано
+reinit_conf_threshold: 0.25       # Нижчий поріг для легшого reinit
+reinit_diou_threshold: -0.7       # Більш толерантний DIoU
+reinit_diou_max: -0.95
+reinit_adaptive_rate: 20          # Швидша адаптація
+phase3_redetection_validation_frames: 3  # ✅ Валідація увімкнена
+
+# ✅ KALMAN - оптимізовано
+use_kalman: true
+kalman_process_noise: 0.005       # Компромісний між швидкістю та стабільністю
+kalman_measurement_noise: 0.001   # Трохи більше довіри до вимірювань
+
+# ✅ DUAL MEMORY VPE - оптимізовано
+use_dual_memory_vpe: true
+dual_long_term_capacity: 25       # Більша довготермінова пам'ять
+dual_long_term_quality_threshold: 0.65
+dual_long_term_weight: 0.6        # Більша вага LT
+dual_short_term_capacity: 12
+dual_short_term_weight: 0.4
+dual_temporal_decay: 0.92         # Повільніший decay
+dual_update_long_term_every: 40   # Частіше оновлення LT
+dual_replace_worst_lt: true
+dual_use_anchor: true
+dual_anchor_weight: 0.15          # Більша вага anchor
+
+verbose: false
+debug_frame_step: 100

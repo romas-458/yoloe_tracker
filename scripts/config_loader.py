@@ -141,12 +141,14 @@ class ConfigLoader:
         """
         Витягти параметри з data, ігноруючи метадані
 
-        Метадані включають: name, description, tracker, created_date, version, tags
+        Метадані включають: name, description, created_date, version, tags
+        Зберігає 'tracker' в параметрах, щоб можна було визначити тип трекера
         """
         if not isinstance(data, dict):
             return {}
 
-        metadata_keys = {'name', 'description', 'tracker', 'created_date', 'version', 'tags', 'metadata'}
+        # 'tracker' залишаємо в параметрах для визначення типу трекера
+        metadata_keys = {'name', 'description', 'created_date', 'version', 'tags', 'metadata', 'experiment_id'}
 
         params = {k: v for k, v in data.items() if k not in metadata_keys}
 

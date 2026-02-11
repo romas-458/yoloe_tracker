@@ -1,0 +1,50 @@
+# A6: +Adaptive - додати адаптивний confidence
+name: "A6 +Adaptive"
+description: "VPE + Kalman + DIoU + Adaptive confidence"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "A6"
+version: "1.0"
+
+model_path: "yoloe-v8s-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# ✅ ADAPTIVE CONFIDENCE
+conf: 0.01
+conf_max: 0.1                  # Адаптивний до 0.1
+conf_adaptive_rate: 30         # Адаптація увімкнена
+iou_threshold: 0.2
+
+# ✅ VPE з adaptive
+vpe_step: 10
+max_vpe: 50
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.2              # Адаптивний VPE conf
+adaptive_rate: 500
+
+max_lost_frames: 15
+warmup_frames: 0
+warmup_vpe_iou_threshold: 1.5
+
+# ✅ Phase 2 DIoU
+phase2_diou_threshold: -0.0
+waiting_reinit_conf_threshold: 0.3
+waiting_reinit_diou_threshold: -0.5
+
+# ✅ Phase 3 DIoU
+reinit_conf_threshold: 0.3
+reinit_diou_threshold: -0.6
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 25
+phase3_redetection_validation_frames: 0
+
+# ✅ KALMAN
+use_kalman: true
+kalman_process_noise: 0.001
+kalman_measurement_noise: 0.0001
+
+# ❌ DUAL MEMORY ВИМКНЕНО
+use_dual_memory_vpe: false
+
+verbose: false
+debug_frame_step: 100

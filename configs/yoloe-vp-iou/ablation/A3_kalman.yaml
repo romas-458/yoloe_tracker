@@ -1,0 +1,64 @@
+# A3: +Kalman - додати Kalman фільтр без VPE
+name: "A3 +Kalman"
+description: "Baseline + Kalman filter (no VPE)"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "A3"
+version: "1.0"
+
+# Базові параметри
+model_path: "yoloe-v8s-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# Детекція - фіксований confidence
+conf: 0.01
+conf_max: 0.01
+conf_adaptive_rate: 999999
+
+# IoU matching
+iou_threshold: 0.3
+
+# ❌ VPE ВИМКНЕНО
+vpe_step: 10
+max_vpe: 0                    # VPE вимкнено
+vpe_conf_threshold: 0.5
+vpe_conf_max: 0.5
+vpe_conf_adaptive_rate: 999999
+
+# Втрата об'єкта
+max_lost_frames: 15
+
+# Warmup вимкнено
+warmup_frames: 0
+warmup_vpe_iou_threshold: 0.5
+
+# Phase 2 - тільки IoU
+phase2_diou_threshold: 1.0
+
+# Waiting reinit вимкнено
+waiting_reinit_conf_threshold: 1.0
+waiting_reinit_diou_threshold: -0.5
+
+# Phase 3 reinit
+reinit_conf_threshold: 1.0
+reinit_diou_threshold: -1.0
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 15
+phase3_redetection_validation_frames: 0
+
+# ✅ KALMAN УВІМКНЕНО
+use_kalman: true
+kalman_process_noise: 0.001    # Консервативний Kalman
+kalman_measurement_noise: 0.0001
+use_samurai_kalman: false      # Простий Kalman
+kalman_alpha_kf: 0.15
+kalman_tau_kf: 3
+kalman_n_max: 5
+kalman_iou_threshold: 0.3
+hybrid_conf_weight: 0.9
+
+# ❌ DUAL MEMORY ВИМКНЕНО
+use_dual_memory_vpe: false
+
+verbose: false
+debug_frame_step: 100

@@ -1,0 +1,55 @@
+# A4: +VPE+Kalman - комбінація VPE та Kalman
+name: "A4 +VPE+Kalman"
+description: "VPE + Kalman synergy test"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "A4"
+version: "1.0"
+
+model_path: "yoloe-v8s-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# Детекція
+conf: 0.01
+conf_max: 0.01
+conf_adaptive_rate: 999999
+
+# IoU
+iou_threshold: 0.3
+
+# ✅ VPE УВІМКНЕНО
+vpe_step: 10
+max_vpe: 50
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.05
+vpe_conf_adaptive_rate: 999999
+
+max_lost_frames: 15
+
+# ❌ Warmup вимкнено
+warmup_frames: 0
+warmup_vpe_iou_threshold: 0.5
+
+# Phase 2
+phase2_diou_threshold: 1.0
+waiting_reinit_conf_threshold: 1.0
+waiting_reinit_diou_threshold: -0.5
+
+# Phase 3
+reinit_conf_threshold: 1.0
+reinit_diou_threshold: -1.0
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 15
+phase3_redetection_validation_frames: 0
+
+# ✅ KALMAN УВІМКНЕНО
+use_kalman: true
+kalman_process_noise: 0.001
+kalman_measurement_noise: 0.0001
+use_samurai_kalman: false
+
+# ❌ DUAL MEMORY ВИМКНЕНО
+use_dual_memory_vpe: false
+
+verbose: false
+debug_frame_step: 100

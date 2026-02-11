@@ -1,0 +1,19 @@
+# LaSOT Ablation Study Test List
+# 10 відео для абляційних досліджень, що покривають різноманітні умови трекінгу
+#
+# Формат: category-video_number
+#
+# Критерії вибору:
+# 1. Швидкий рух (fast motion)
+# 2. Дрібний об'єкт (small object)
+# 3. Великий об'єкт (large object)
+# 4. Зміна масштабу (scale variation)
+# 5. Камуфляж/подібний фон (camouflage/similar background)
+# 6. Часткова оклюзія (partial occlusion)
+# 7. Обертання (rotation/orientation change)
+# 8. Деформація (deformation)
+# 9. Складне освітлення (challenging illumination)
+# 10. Артикуляція (articulation)
+
+airplane-1        # Швидкий рух, невеликий об'єкт, зміна масштабу, небо як фон
+drone-2           # Швидкий рух, зміна масштабу, рухома камера, складний фон

@@ -1,0 +1,57 @@
+# A2: +VPE - додати Visual Prompt Engineering
+name: "A2 +VPE"
+description: "Baseline + VPE (visual prompt engineering)"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "A2"
+version: "1.0"
+
+# Базові параметри
+model_path: "yoloe-v8s-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# Детекція - фіксований confidence
+conf: 0.01
+conf_max: 0.01
+conf_adaptive_rate: 999999
+
+# IoU matching
+iou_threshold: 0.3
+
+# ✅ VPE УВІМКНЕНО
+vpe_step: 10
+max_vpe: 50                   # VPE увімкнено!
+vpe_conf_threshold: 0.05      # Поріг для VPE
+vpe_conf_max: 0.05
+vpe_conf_adaptive_rate: 999999
+
+# Втрата об'єкта
+max_lost_frames: 15
+
+# ❌ Warmup вимкнено
+warmup_frames: 0
+warmup_vpe_iou_threshold: 0.5
+
+# Phase 2 - тільки IoU
+phase2_diou_threshold: 1.0
+
+# Waiting reinit вимкнено
+waiting_reinit_conf_threshold: 1.0
+waiting_reinit_diou_threshold: -0.5
+
+# Phase 3 reinit
+reinit_conf_threshold: 1.0
+reinit_diou_threshold: -1.0
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 15
+phase3_redetection_validation_frames: 0
+
+# ❌ KALMAN ВИМКНЕНО
+use_kalman: false
+use_samurai_kalman: false
+
+# ❌ DUAL MEMORY ВИМКНЕНО
+use_dual_memory_vpe: false
+
+verbose: false
+debug_frame_step: 100

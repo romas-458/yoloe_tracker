@@ -135,7 +135,10 @@ class ModularEvaluator:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith('#'):
-                        test_videos.add(line)
+                        # Видалити inline коментарі (все після #)
+                        video_name = line.split('#')[0].strip()
+                        if video_name:
+                            test_videos.add(video_name)
         return test_videos
 
     def find_sequences(self, data_dir: Path,
@@ -478,6 +481,12 @@ class ModularEvaluator:
                 success, bbox = tracker.update(image)
                 results.append(bbox if success else None)
 
+                # Debug інформація з proximity таблицею (для Phase 1)
+                if hasattr(tracker, 'get_debug_info'):
+                    debug_info = tracker.get_debug_info()
+                    if debug_info.get('show_proximity_table') and debug_info.get('proximity_info'):
+                        self._print_proximity_table(debug_info, idx)
+
             # Візуалізація
             if visualize and vis_dir:
                 self._visualize_frame(image, results[-1], groundtruth[idx],
@@ -495,6 +504,9 @@ class ModularEvaluator:
         tracking_info = None
         if tracker and hasattr(tracker, 'get_tracking_info'):
             tracking_info = tracker.get_tracking_info()
+
+        # Запам'ятати висоту першої таблиці для розміщення другої таблиці нижче
+        first_table_height = 0
 
         # Додати інформацію про модель у верхній частині
         model_path = self.tracker_params.get('model_path', '')
@@ -591,11 +603,29 @@ class ModularEvaluator:
                     iou = candidate.get('iou', 0.0)
                     affinity = candidate.get('affinity', 0.0)
                     hybrid = candidate.get('hybrid', 0.0)
-                    conf = candidate.get('conf', 0.0)
+                    # Ключ може бути 'conf' або 'confidence' залежно від трекера
+                    conf = candidate.get('conf', candidate.get('confidence', 0.0))
                     is_best = candidate.get('is_best_match', False)
 
-                    status = "⭐BEST" if is_best else ""
+                    status = "BEST" if is_best else ""
                     line = f"{idx+1} | {iou:.3f} | {affinity:.3f} | {hybrid:.3f} | {conf:.3f} | {status}"
+                    table_lines.append(line)
+            elif candidate_type in ['phase2', 'phase3']:
+                # Таблиця для Phase 2/3: # | Phase | DIoU | conf | status
+                table_header = "# | Phase | DIoU   | Conf   | Status"
+                table_lines = [table_header, "-" * len(table_header)]
+
+                for idx, candidate in enumerate(candidates):
+                    phase_label = "P2" if candidate.get('phase', 0) == 2 else "P3"
+                    diou = candidate.get('diou', 0.0)
+                    # Ключ може бути 'conf' або 'confidence' залежно від трекера
+                    conf = candidate.get('conf', candidate.get('confidence', 0.0))
+                    status = candidate.get('status', 'unknown')
+                    is_best = candidate.get('is_best_match', False)
+                    status_text = "ACCEPT" if status == 'accepted' else "REJECT"
+                    best_marker = " BEST" if is_best else ""
+
+                    line = f"{idx+1} | {phase_label}  | {diou:.3f} | {conf:.3f} | {status_text}{best_marker}"
                     table_lines.append(line)
             else:
                 # Таблиця для standard: # | IoU | conf | size | status
@@ -604,12 +634,13 @@ class ModularEvaluator:
 
                 for idx, candidate in enumerate(candidates):
                     iou = candidate.get('iou', 0.0)
-                    conf = candidate.get('conf', 0.0)
+                    # Ключ може бути 'conf' або 'confidence' залежно від трекера
+                    conf = candidate.get('conf', candidate.get('confidence', 0.0))
                     size_valid = candidate.get('size_valid', True)
                     is_best = candidate.get('is_best_match', False)
 
-                    size_status = "✅" if size_valid else "⚠️"
-                    status = "⭐BEST" if is_best else ""
+                    size_status = "OK" if size_valid else "SMALL"
+                    status = "BEST" if is_best else ""
                     line = f"{idx+1} | {iou:.3f} | {conf:.3f} | {size_status} | {status}"
                     table_lines.append(line)
 
@@ -621,6 +652,7 @@ class ModularEvaluator:
 
             # Фон для таблиці
             table_height = len(table_lines) * line_height + 10
+            first_table_height = table_height  # Запам'ятати висоту для другої таблиці
             cv2.rectangle(image, (5, 5), (400, 5 + table_height), (30, 30, 30), -1)
             cv2.rectangle(image, (5, 5), (400, 5 + table_height), (200, 200, 200), 1)
 
@@ -684,6 +716,56 @@ class ModularEvaluator:
                 cv2.putText(image, text, (x, y - 5),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
 
+            # Таблиця для Phase 2/3 search candidates з статусом прийняття/відкидання
+            if len(candidates) > 0:
+                phase = candidates[0].get('phase', 0)
+
+                # Формування таблиці
+                table_header = "# | Phase | DIoU   | Conf   | Status"
+                table_lines = [table_header, "-" * len(table_header)]
+
+                for idx, candidate in enumerate(candidates):
+                    phase_label = "P2" if candidate.get('phase', 0) == 2 else "P3"
+                    diou_val = candidate.get('diou', -float('inf'))
+                    # Ключ може бути 'conf' або 'confidence' залежно від трекера
+                    conf_val = candidate.get('conf', candidate.get('confidence', 0.0))
+                    status = candidate.get('status', 'unknown')
+                    status_text = "ACCEPT" if status == 'accepted' else "REJECT"
+
+                    line = f"{idx+1} | {phase_label}  | {diou_val:.3f} | {conf_val:.3f} | {status_text}"
+                    table_lines.append(line)
+
+                # Малювати таблицю нижче першої таблиці (top_candidates)
+                font_size = 0.35
+                font_thickness = 1
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                line_height = 18
+
+                # Фон для таблиці
+                table_height = len(table_lines) * line_height + 10
+
+                # Обчислити Y позицію нижче першої таблиці
+                # first_table_height запам'ятана при малюванні першої таблиці
+                zazor = 10  # Невеликий зазор між таблицями
+                table_y1 = 5 + first_table_height + zazor
+                table_y2 = table_y1 + table_height
+
+                cv2.rectangle(image, (5, table_y1), (420, table_y2), (30, 30, 30), -1)
+                cv2.rectangle(image, (5, table_y1), (420, table_y2), (200, 200, 200), 1)
+
+                # Малювати рядки таблиці
+                for line_idx, line in enumerate(table_lines):
+                    y_pos = table_y1 + 15 + line_idx * line_height
+
+                    # Заголовок та розділювач - білий, інші рядки - сірий
+                    if line_idx < 2:
+                        text_color = (255, 255, 255)
+                    else:
+                        text_color = (200, 200, 200)
+
+                    cv2.putText(image, line, (10, y_pos),
+                               font, font_size, text_color, font_thickness)
+
         # Last valid bbox (Фаза 2 - пошук/очікування) - помаранчевий
         if tracking_info and tracking_info.get('last_valid_bbox'):
             last_valid = tracking_info['last_valid_bbox']
@@ -722,12 +804,35 @@ class ModularEvaluator:
 
         # Додаткова інформація про класи (якщо трекер підтримує)
         if tracking_info:
-            y_offset = 30
+            # Розміщувати цю інформацію нижче таблиць, щоб уникнути накладання
+            # Обчислити Y початку на основі висоти таблиць
+            zazor_after_tables = 20
 
-            # Поточний клас
+            if first_table_height > 0:
+                # Якщо є таблиці, розміщувати нижче них
+                y_offset = 5 + first_table_height + zazor_after_tables
+
+                # Якщо є друга таблиця (search_candidates), розміщувати ще нижче
+                if tracking_info.get('search_candidates'):
+                    # Друга таблиця також має висоту, приблизно 100-150px
+                    # Додаємо додатковий зазор
+                    y_offset += 150
+            else:
+                # Якщо немає таблиць, розміщувати в верхньому куті
+                y_offset = 30
+
+            # Поточний клас - використовувати confidence з best candidate у таблиці
             if tracking_info.get('current_class') is not None:
                 class_id = tracking_info['current_class']
                 class_conf = tracking_info.get('current_class_conf', 0.0)
+
+                # Якщо є top_candidates, використовувати confidence з BEST candidate
+                if tracking_info.get('top_candidates'):
+                    for candidate in tracking_info['top_candidates']:
+                        if candidate.get('is_best_match', False):
+                            class_conf = candidate.get('confidence', class_conf)
+                            break
+
                 text = f"Class: {class_id} ({class_conf:.2f})"
                 cv2.putText(image, text, (10, y_offset),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
@@ -830,6 +935,89 @@ class ModularEvaluator:
         }
 
         return metrics
+
+    def _print_proximity_table(self, debug_info: Dict, frame_idx: int):
+        """
+        Вивести таблицю proximity до anchor та memory для Phase 1
+
+        Args:
+            debug_info: Dict з результатом get_debug_info()
+            frame_idx: Індекс кадру
+        """
+        try:
+            proximity = debug_info.get('proximity_info', {})
+            metadata = proximity.get('metadata', {})
+
+            print(f"\n{'='*100}")
+            print(f"🔍 PHASE 1 PROXIMITY DEBUG TABLE [Frame {frame_idx}]")
+            print(f"{'='*100}")
+
+            # Anchor VPE інформація
+            anchor_info = metadata.get('anchor', {})
+            print(f"\n📌 ANCHOR VPE:")
+            print(f"   Available: {anchor_info.get('available')}")
+            if anchor_info.get('available'):
+                conf_val = anchor_info.get('conf')
+                print(f"   Conf: {conf_val:.3f}" if conf_val is not None else f"   Conf: N/A")
+                print(f"   Frame: {anchor_info.get('frame')}")
+
+            anchor_prox = proximity.get('anchor_proximity')
+            prox_str = f"{anchor_prox:.3f}" if anchor_prox is not None else 'N/A'
+            print(f"   Proximity: {prox_str}")
+
+            # Long-term memory інформація
+            lt_info = metadata.get('long_term', {})
+            print(f"\n📌 LONG-TERM MEMORY:")
+            print(f"   Count: {lt_info.get('count')}/{lt_info.get('capacity')}")
+            if lt_info.get('confs'):
+                print(f"   Confs: {[f'{c:.3f}' for c in lt_info.get('confs', [])]}")
+                print(f"   Frames: {lt_info.get('frames', [])}")
+
+            lt_prox = proximity.get('lt_proximity')
+            prox_str = f"{lt_prox:.3f}" if lt_prox is not None else 'N/A'
+            print(f"   Proximity: {prox_str}")
+
+            # Short-term memory інформація
+            st_info = metadata.get('short_term', {})
+            print(f"\n📌 SHORT-TERM MEMORY:")
+            print(f"   Count: {st_info.get('count')}/{st_info.get('capacity')}")
+            if st_info.get('confs'):
+                print(f"   Confs: {[f'{c:.3f}' for c in st_info.get('confs', [])]}")
+                print(f"   Ages: {st_info.get('ages', [])}")
+                print(f"   Frames: {st_info.get('frames', [])}")
+
+            st_prox = proximity.get('st_proximity')
+            prox_str = f"{st_prox:.3f}" if st_prox is not None else 'N/A'
+            print(f"   Proximity: {prox_str}")
+
+            # Додати таблицю для всіх детекцій на кадрі
+            detections = proximity.get('detections', [])
+            selected_idx = proximity.get('selected_detection_idx')
+            if detections:
+                print(f"\n📊 ALL DETECTIONS PROXIMITY (Top-7 + Tracked):")
+                print(f"   {'Idx':<4} {'Conf':<7} {'IoU':<7} {'Anchor':<10} {'LT':<10} {'ST':<10} {'Status':<10}")
+                print(f"   {'-'*75}")
+                for det in detections:
+                    idx = det.get('idx', '?')
+                    conf = det.get('conf', 0)
+                    iou = det.get('iou', 0)
+                    anchor_p = det.get('anchor_proximity')
+                    lt_p = det.get('lt_proximity')
+                    st_p = det.get('st_proximity')
+
+                    anchor_str = f"{anchor_p:.3f}" if anchor_p is not None else 'N/A'
+                    lt_str = f"{lt_p:.3f}" if lt_p is not None else 'N/A'
+                    st_str = f"{st_p:.3f}" if st_p is not None else 'N/A'
+
+                    # Позначити вибрану детекцію
+                    status = "✅ TRACKED" if idx == selected_idx else ""
+
+                    print(f"   {idx:<4} {conf:<7.3f} {iou:<7.3f} {anchor_str:<10} {lt_str:<10} {st_str:<10} {status:<10}")
+
+            print(f"\n{'='*100}\n")
+
+        except Exception as e:
+            print(f"⚠️  Error printing proximity table: {e}")
 
     @staticmethod
     def _compute_iou(bbox1: List[float], bbox2: List[float]) -> float:
@@ -1212,9 +1400,12 @@ def main():
     # Handle --first parameter
     max_videos = args.max_videos or args.first
 
+    # Визначити ім'я трекера: з конфігу (пріоритет) або з аргументу --tracker
+    tracker_name = tracker_params.get('tracker', args.tracker) if tracker_params else args.tracker
+
     # Evaluator
     evaluator = ModularEvaluator(
-        tracker_name=args.tracker,
+        tracker_name=tracker_name,
         tracker_params=tracker_params,
         output_dir=Path(args.output),
         dataset=args.dataset,
