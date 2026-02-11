@@ -1,0 +1,34 @@
+# YOLOe-ClassReinit з агресивним Kalman фільтром
+# Для швидкорухомих об'єктів, швидко реагуємо на нові детекції
+name: "YOLOe-ClassReinit Aggressive"
+tracker: "YOLOe-ClassReinit"
+created_date: "2026-02-11"
+version: "1.0"
+
+model_path: "yoloe-v8s-seg-pf.pt"
+imgsz: 640
+conf: 0.25
+iou_threshold: 0.4
+
+class_update_interval: 5
+min_class_confidence: 0.5
+use_class_for_reinit: true
+class_filter_mode: "all"
+
+max_lost_frames: 10
+reidentify_after_lost: true
+reidentify_iou_threshold: 0.0
+max_reidentify_attempts: 30
+
+warmup_frames: 10
+warmup_conf: 0.15
+vpe_iou_threshold: 0.5
+
+# Агресивні параметри Kalman
+# - Вищий process_noise = швидша адаптація до руху
+# - Нижчий measurement_noise = більше довіруємо детекціям
+use_kalman: true
+kalman_process_noise: 0.1        # Високий - швидко адаптується
+kalman_measurement_noise: 1.0     # Низький - довіряємо детекціям
+
+device: "cuda"

@@ -1,0 +1,43 @@
+# YOLOe Class-Reinit Tracker з Kalman фільтром
+name: "YOLOe-ClassReinit Kalman"
+description: "YOLOe з реініціалізацією на основі класів + Kalman фільтр для згладжування"
+tracker: "YOLOe-ClassReinit"
+created_date: "2026-02-11"
+version: "1.0"
+tags:
+  - "yoloe-class-reinit"
+  - "kalman"
+  - "class-based"
+  - "drone"
+
+# Параметри детекції
+model_path: "yoloe-v8s-seg-pf.pt"
+imgsz: 640
+conf: 0.01
+iou_threshold: 0.4
+
+# Параметри класів
+class_update_interval: 5
+min_class_confidence: 0.5
+use_class_for_reinit: true
+class_filter_mode: "all"  # "all", "top3" або "dominant"
+
+# Параметри втрати та реідентифікації
+max_lost_frames: 10
+reidentify_after_lost: true
+reidentify_iou_threshold: 0.0
+max_reidentify_attempts: 30
+
+# Параметри warmup для VPE (Virtual Positive Examples)
+warmup_frames: 10
+warmup_conf: 0.15
+vpe_iou_threshold: 0.5
+
+# ✨ Параметри Kalman фільтра
+use_kalman: true
+kalman_process_noise: 0.01      # Шум процесу (вища = швидша адаптація)
+kalman_measurement_noise: 0.001   # Шум вимірювання (вища = більше згладжування)
+
+device: "cuda"
+verbose: true
+debug_frame_step: 10
