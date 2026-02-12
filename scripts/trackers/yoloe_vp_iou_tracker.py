@@ -427,6 +427,10 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.reinit_adaptive_rate = reinit_adaptive_rate
         self.reinit_conf_threshold = reinit_conf_threshold
         self.phase3_redetection_validation_frames = phase3_redetection_validation_frames
+
+        # Phase 1 High Confidence Re-ID
+        self.phase1_high_conf_reid_threshold = kwargs.get('phase1_high_conf_reid_threshold', 0.9)
+        self.phase1_high_conf_reid_iou = kwargs.get('phase1_high_conf_reid_iou', 0.3)
         self.use_kalman = use_kalman
         self.kalman_process_noise = kalman_process_noise
         self.kalman_measurement_noise = kalman_measurement_noise
@@ -1061,6 +1065,51 @@ class YOLOeVPIoUTracker(BaseTracker):
                             })
 
                 self.search_candidates = []  # Очистити search candidates (Phase 2/3)
+
+                # ========================================
+                # Phase 1 High Confidence Re-ID Override
+                # ========================================
+                # Якщо був період втрати (lost_frames > 0), перевірити чи є детекція
+                # з екстремально високою впевненістю - це може бути оригінальний об'єкт
+                if self.lost_frames > 0 and self.phase1_high_conf_reid_threshold < 1.0:
+                    high_conf_candidates = []
+                    for idx, box in enumerate(boxes):
+                        box_xyxy = box.xyxy[0].cpu().numpy()
+                        box_conf = float(box.conf[0].cpu().numpy())
+
+                        # Перевірити високу впевненість
+                        if box_conf >= self.phase1_high_conf_reid_threshold:
+                            # Обчислити IoU з last_valid_bbox (не current!)
+                            iou_with_original = self._compute_iou(self.last_valid_bbox, box_xyxy)
+
+                            if iou_with_original >= self.phase1_high_conf_reid_iou:
+                                high_conf_candidates.append({
+                                    'idx': idx,
+                                    'bbox': box_xyxy,
+                                    'conf': box_conf,
+                                    'iou': iou_with_original
+                                })
+
+                    # Якщо знайдено high-conf кандидата, і він не той самий що best match
+                    if len(high_conf_candidates) > 0:
+                        # Взяти кандидата з найвищою впевненістю
+                        best_high_conf = max(high_conf_candidates, key=lambda x: x['conf'])
+
+                        # Перевірити чи це не той самий об'єкт що вже відстежується
+                        if best_high_conf['idx'] != best_iou_idx:
+                            if self.verbose:
+                                print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override!")
+                                print(f"   Переключення з IoU={best_iou:.3f}/Conf={box_conf:.3f} → IoU={best_high_conf['iou']:.3f}/Conf={best_high_conf['conf']:.3f}")
+
+                            # Переключитися на high-conf детекцію
+                            best_iou_idx = best_high_conf['idx']
+                            best_iou = best_high_conf['iou']
+                            box_xyxy = best_high_conf['bbox']
+                            box_conf = best_high_conf['conf']
+
+                            # Оновити current_bbox
+                            self.current_bbox = box_xyxy.tolist()
+                            self.last_valid_bbox = self.current_bbox.copy()
 
                 if self.verbose:
                     if self.use_kalman:

@@ -27,7 +27,8 @@ warmup_frames: 0                  # Warmup вимкнено
 
 # ✅ Phase 2 DIoU - оптимізовано
 phase2_diou_threshold: -0.1       # Більш толерантний
-waiting_reinit_conf_threshold: 0.35
+#waiting_reinit_conf_threshold: 0.35
+waiting_reinit_conf_threshold: 1.0
 waiting_reinit_diou_threshold: -0.6
 
 # ✅ Phase 3 DIoU - оптимізовано
@@ -36,6 +37,10 @@ reinit_diou_threshold: -0.7       # Більш толерантний DIoU
 reinit_diou_max: -0.95
 reinit_adaptive_rate: 20          # Швидша адаптація
 phase3_redetection_validation_frames: 3  # ✅ Валідація увімкнена
+
+# ✅ Phase 1 High Confidence Re-ID - оптимізовано
+phase1_high_conf_reid_threshold: 0.9     # Екстремально висока впевненість для override
+phase1_high_conf_reid_iou: 0.3           # Мінімальний IoU для re-ID
 
 # ✅ KALMAN - оптимізовано
 use_kalman: true
@@ -56,4 +61,4 @@ dual_use_anchor: true
 dual_anchor_weight: 0.15          # Більша вага anchor
 
 verbose: false
-debug_frame_step: 100
+debug_frame_step: 10000
