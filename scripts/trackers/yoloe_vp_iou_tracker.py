@@ -950,8 +950,51 @@ class YOLOeVPIoUTracker(BaseTracker):
                     else:
                         print(f"   ⚠️  Box {cand['idx']}: IoU={cand['iou']:.3f}, conf={cand['conf']:.3f} (W/H={cand['size_ratio_w']:.2f}/{cand['size_ratio_h']:.2f}) - size_ratio невалідна")
 
-            # Перевірка IoU threshold та розміру
-            if best_iou >= self.iou_threshold:
+            # ========================================
+            # Phase 1 High Confidence Re-ID (Pre-check)
+            # ========================================
+            # Перевірити чи є детекція з екстремально високою впевненістю
+            # ЦЕ ВИКОНУЄТЬСЯ ПЕРЕД перевіркою IoU threshold!
+            high_conf_override = False
+            if self.lost_frames > 0 and self.phase1_high_conf_reid_threshold < 1.0:
+                high_conf_candidates = []
+                for idx, box in enumerate(boxes):
+                    box_xyxy_temp = box.xyxy[0].cpu().numpy()
+                    box_conf_temp = float(box.conf[0].cpu().numpy())
+
+                    # Перевірити високу впевненість
+                    if box_conf_temp >= self.phase1_high_conf_reid_threshold:
+                        # Обчислити IoU з last_valid_bbox
+                        iou_with_original = self._compute_iou(self.last_valid_bbox, box_xyxy_temp)
+
+                        if iou_with_original >= self.phase1_high_conf_reid_iou:
+                            high_conf_candidates.append({
+                                'idx': idx,
+                                'bbox': box_xyxy_temp,
+                                'conf': box_conf_temp,
+                                'iou': iou_with_original
+                            })
+
+                # Якщо знайдено high-conf кандидата
+                if len(high_conf_candidates) > 0:
+                    # Взяти кандидата з найвищою впевненістю
+                    best_high_conf = max(high_conf_candidates, key=lambda x: x['conf'])
+
+                    if self.verbose:
+                        print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override!")
+                        print(f"   Знайдено детекцію з conf={best_high_conf['conf']:.3f} (IoU={best_high_conf['iou']:.3f} з original)")
+                        print(f"   Переключення на high-conf детекцію (замість best_iou={best_iou:.3f})")
+
+                    # Примусово встановити як best match
+                    best_iou_idx = best_high_conf['idx']
+                    best_iou = best_high_conf['iou']
+                    high_conf_override = True
+
+                    # Force Phase 1 success
+                    # Тепер best_iou може бути < threshold, але ми все одно обробимо як успіх
+
+            # Перевірка IoU threshold та розміру (або high_conf_override)
+            if best_iou >= self.iou_threshold or high_conf_override:
                 # ========================================
                 # ФАЗА 1: УСПІШНИЙ IoU MATCHING
                 # ========================================
@@ -1065,51 +1108,6 @@ class YOLOeVPIoUTracker(BaseTracker):
                             })
 
                 self.search_candidates = []  # Очистити search candidates (Phase 2/3)
-
-                # ========================================
-                # Phase 1 High Confidence Re-ID Override
-                # ========================================
-                # Якщо був період втрати (lost_frames > 0), перевірити чи є детекція
-                # з екстремально високою впевненістю - це може бути оригінальний об'єкт
-                if self.lost_frames > 0 and self.phase1_high_conf_reid_threshold < 1.0:
-                    high_conf_candidates = []
-                    for idx, box in enumerate(boxes):
-                        box_xyxy = box.xyxy[0].cpu().numpy()
-                        box_conf = float(box.conf[0].cpu().numpy())
-
-                        # Перевірити високу впевненість
-                        if box_conf >= self.phase1_high_conf_reid_threshold:
-                            # Обчислити IoU з last_valid_bbox (не current!)
-                            iou_with_original = self._compute_iou(self.last_valid_bbox, box_xyxy)
-
-                            if iou_with_original >= self.phase1_high_conf_reid_iou:
-                                high_conf_candidates.append({
-                                    'idx': idx,
-                                    'bbox': box_xyxy,
-                                    'conf': box_conf,
-                                    'iou': iou_with_original
-                                })
-
-                    # Якщо знайдено high-conf кандидата, і він не той самий що best match
-                    if len(high_conf_candidates) > 0:
-                        # Взяти кандидата з найвищою впевненістю
-                        best_high_conf = max(high_conf_candidates, key=lambda x: x['conf'])
-
-                        # Перевірити чи це не той самий об'єкт що вже відстежується
-                        if best_high_conf['idx'] != best_iou_idx:
-                            if self.verbose:
-                                print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override!")
-                                print(f"   Переключення з IoU={best_iou:.3f}/Conf={box_conf:.3f} → IoU={best_high_conf['iou']:.3f}/Conf={best_high_conf['conf']:.3f}")
-
-                            # Переключитися на high-conf детекцію
-                            best_iou_idx = best_high_conf['idx']
-                            best_iou = best_high_conf['iou']
-                            box_xyxy = best_high_conf['bbox']
-                            box_conf = best_high_conf['conf']
-
-                            # Оновити current_bbox
-                            self.current_bbox = box_xyxy.tolist()
-                            self.last_valid_bbox = self.current_bbox.copy()
 
                 if self.verbose:
                     if self.use_kalman:
