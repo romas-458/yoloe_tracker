@@ -431,6 +431,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Phase 1 High Confidence Re-ID
         self.phase1_high_conf_reid_threshold = kwargs.get('phase1_high_conf_reid_threshold', 0.9)
         self.phase1_high_conf_reid_iou = kwargs.get('phase1_high_conf_reid_iou', 0.3)
+        self.phase1_high_conf_reid_require_lost = kwargs.get('phase1_high_conf_reid_require_lost', False)
         self.use_kalman = use_kalman
         self.kalman_process_noise = kalman_process_noise
         self.kalman_measurement_noise = kalman_measurement_noise
@@ -956,7 +957,14 @@ class YOLOeVPIoUTracker(BaseTracker):
             # Перевірити чи є детекція з екстремально високою впевненістю
             # ЦЕ ВИКОНУЄТЬСЯ ПЕРЕД перевіркою IoU threshold!
             high_conf_override = False
-            if self.lost_frames > 0 and self.phase1_high_conf_reid_threshold < 1.0:
+
+            # Перевірка умови lost_frames (опціонально)
+            should_check_high_conf = (
+                self.phase1_high_conf_reid_threshold < 1.0 and
+                (not self.phase1_high_conf_reid_require_lost or self.lost_frames > 0)
+            )
+
+            if should_check_high_conf:
                 # Отримати впевненість поточного best match (якщо є)
                 current_best_conf = 0.0
                 if best_iou_idx >= 0 and best_iou_idx < len(boxes):
