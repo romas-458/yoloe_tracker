@@ -957,13 +957,19 @@ class YOLOeVPIoUTracker(BaseTracker):
             # ЦЕ ВИКОНУЄТЬСЯ ПЕРЕД перевіркою IoU threshold!
             high_conf_override = False
             if self.lost_frames > 0 and self.phase1_high_conf_reid_threshold < 1.0:
+                # Отримати впевненість поточного best match (якщо є)
+                current_best_conf = 0.0
+                if best_iou_idx >= 0 and best_iou_idx < len(boxes):
+                    current_best_conf = float(boxes[best_iou_idx].conf[0].cpu().numpy())
+
                 high_conf_candidates = []
                 for idx, box in enumerate(boxes):
                     box_xyxy_temp = box.xyxy[0].cpu().numpy()
                     box_conf_temp = float(box.conf[0].cpu().numpy())
 
-                    # Перевірити високу впевненість
-                    if box_conf_temp >= self.phase1_high_conf_reid_threshold:
+                    # Перевірити високу впевненість ТА порівняти з поточним
+                    if (box_conf_temp >= self.phase1_high_conf_reid_threshold and
+                        box_conf_temp > current_best_conf):
                         # Обчислити IoU з last_valid_bbox
                         iou_with_original = self._compute_iou(self.last_valid_bbox, box_xyxy_temp)
 
@@ -982,8 +988,9 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                     if self.verbose:
                         print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override!")
-                        print(f"   Знайдено детекцію з conf={best_high_conf['conf']:.3f} (IoU={best_high_conf['iou']:.3f} з original)")
-                        print(f"   Переключення на high-conf детекцію (замість best_iou={best_iou:.3f})")
+                        print(f"   Поточний: conf={current_best_conf:.3f}, best_iou={best_iou:.3f}")
+                        print(f"   Новий: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
+                        print(f"   Переключення на high-conf детекцію (Δconf={best_high_conf['conf']-current_best_conf:.3f})")
 
                     # Примусово встановити як best match
                     best_iou_idx = best_high_conf['idx']
