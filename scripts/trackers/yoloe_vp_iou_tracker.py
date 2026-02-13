@@ -432,6 +432,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.phase1_high_conf_reid_threshold = kwargs.get('phase1_high_conf_reid_threshold', 0.9)
         self.phase1_high_conf_reid_iou = kwargs.get('phase1_high_conf_reid_iou', 0.3)
         self.phase1_high_conf_reid_require_lost = kwargs.get('phase1_high_conf_reid_require_lost', False)
+        self.phase1_high_conf_reid_validation_frames = kwargs.get('phase1_high_conf_reid_validation_frames', 0)
+        self.phase1_high_conf_reid_conf_gap = kwargs.get('phase1_high_conf_reid_conf_gap', 0.0)
         self.use_kalman = use_kalman
         self.kalman_process_noise = kalman_process_noise
         self.kalman_measurement_noise = kalman_measurement_noise
@@ -532,6 +534,10 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.in_phase3_validation = False  # Чи ми в режимі validation після Phase 3 реініціалізації
         self.phase3_validation_consecutive_successes = 0  # Лічильник послідовних успішних фреймів у validation режимі
         self.phase3_validation_bbox = None  # Bbox що перевіряється у validation режимі
+
+        # Phase 1 High Confidence Re-ID Validation
+        self.phase1_high_conf_reid_candidate = None  # Кандидат для high-conf re-ID (dict з bbox, conf, iou)
+        self.phase1_high_conf_reid_validation_count = 0  # Лічильник послідовних успішних валідацій
 
         if self.verbose:
             # Conf adaptive info
@@ -975,9 +981,10 @@ class YOLOeVPIoUTracker(BaseTracker):
                     box_xyxy_temp = box.xyxy[0].cpu().numpy()
                     box_conf_temp = float(box.conf[0].cpu().numpy())
 
-                    # Перевірити високу впевненість ТА порівняти з поточним
+                    # Перевірити високу впевненість ТА порівняти з поточним (з gap)
+                    conf_gap_threshold = current_best_conf + self.phase1_high_conf_reid_conf_gap
                     if (box_conf_temp >= self.phase1_high_conf_reid_threshold and
-                        box_conf_temp > current_best_conf):
+                        box_conf_temp > conf_gap_threshold):
                         # Обчислити IoU з last_valid_bbox
                         iou_with_original = self._compute_iou(self.last_valid_bbox, box_xyxy_temp)
 
@@ -994,19 +1001,69 @@ class YOLOeVPIoUTracker(BaseTracker):
                     # Взяти кандидата з найвищою впевненістю
                     best_high_conf = max(high_conf_candidates, key=lambda x: x['conf'])
 
-                    if self.verbose:
-                        print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override!")
-                        print(f"   Поточний: conf={current_best_conf:.3f}, best_iou={best_iou:.3f}")
-                        print(f"   Новий: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
-                        print(f"   Переключення на high-conf детекцію (Δconf={best_high_conf['conf']-current_best_conf:.3f})")
+                    # Перевірка чи потрібна temporal validation
+                    if self.phase1_high_conf_reid_validation_frames > 0:
+                        # ===== TEMPORAL VALIDATION MODE =====
+                        # Перевірити чи це той самий кандидат що і раніше
+                        is_same_candidate = False
+                        if self.phase1_high_conf_reid_candidate is not None:
+                            prev_bbox = self.phase1_high_conf_reid_candidate['bbox']
+                            curr_bbox = best_high_conf['bbox']
+                            candidate_iou = self._compute_iou(prev_bbox, curr_bbox)
+                            # Вважаємо що це той самий кандидат якщо IoU > 0.5
+                            is_same_candidate = candidate_iou > 0.5
 
-                    # Примусово встановити як best match
-                    best_iou_idx = best_high_conf['idx']
-                    best_iou = best_high_conf['iou']
-                    high_conf_override = True
+                        if is_same_candidate:
+                            # Продовжити валідацію того самого кандидата
+                            self.phase1_high_conf_reid_validation_count += 1
+                            if self.verbose:
+                                print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID валідація {self.phase1_high_conf_reid_validation_count}/{self.phase1_high_conf_reid_validation_frames}")
+                                print(f"   Кандидат: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
 
-                    # Force Phase 1 success
-                    # Тепер best_iou може бути < threshold, але ми все одно обробимо як успіх
+                            # Перевірити чи досягнуто порогу валідації
+                            if self.phase1_high_conf_reid_validation_count >= self.phase1_high_conf_reid_validation_frames:
+                                # Валідація успішна - перемкнутися!
+                                if self.verbose:
+                                    print(f"✅ Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override! (валідація пройдена)")
+                                    print(f"   Поточний: conf={current_best_conf:.3f}, best_iou={best_iou:.3f}")
+                                    print(f"   Новий: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
+                                    print(f"   Переключення на high-conf детекцію (Δconf={best_high_conf['conf']-current_best_conf:.3f})")
+
+                                # Примусово встановити як best match
+                                best_iou_idx = best_high_conf['idx']
+                                best_iou = best_high_conf['iou']
+                                high_conf_override = True
+
+                                # Скинути валідацію
+                                self.phase1_high_conf_reid_candidate = None
+                                self.phase1_high_conf_reid_validation_count = 0
+                        else:
+                            # Новий кандидат - почати валідацію спочатку
+                            self.phase1_high_conf_reid_candidate = best_high_conf
+                            self.phase1_high_conf_reid_validation_count = 1
+                            if self.verbose:
+                                print(f"🆕 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID новий кандидат виявлено")
+                                print(f"   Кандидат: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
+                                print(f"   Початок валідації 1/{self.phase1_high_conf_reid_validation_frames}")
+                    else:
+                        # ===== IMMEDIATE MODE (без validation) =====
+                        if self.verbose:
+                            print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override!")
+                            print(f"   Поточний: conf={current_best_conf:.3f}, best_iou={best_iou:.3f}")
+                            print(f"   Новий: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
+                            print(f"   Переключення на high-conf детекцію (Δconf={best_high_conf['conf']-current_best_conf:.3f})")
+
+                        # Примусово встановити як best match
+                        best_iou_idx = best_high_conf['idx']
+                        best_iou = best_high_conf['iou']
+                        high_conf_override = True
+                else:
+                    # Кандидатів не знайдено - скинути валідацію якщо була
+                    if self.phase1_high_conf_reid_candidate is not None:
+                        if self.verbose:
+                            print(f"❌ Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID валідація скинута (кандидат втрачено)")
+                        self.phase1_high_conf_reid_candidate = None
+                        self.phase1_high_conf_reid_validation_count = 0
 
             # Перевірка IoU threshold та розміру (або high_conf_override)
             if best_iou >= self.iou_threshold or high_conf_override:
@@ -2015,6 +2072,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.in_warmup = False
         self.warmup_vpe_collected = 0
         self.kalman = None  # Скинути Калман фільтр
+        self.phase1_high_conf_reid_candidate = None
+        self.phase1_high_conf_reid_validation_count = 0
 
     def get_tracking_info(self) -> Dict[str, Any]:
         """

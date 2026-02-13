@@ -42,6 +42,8 @@ phase3_redetection_validation_frames: 3  # ✅ Валідація увімкне
 phase1_high_conf_reid_threshold: 0.9     # Екстремально висока впевненість для override
 phase1_high_conf_reid_iou: 0.0           # Мінімальний IoU для re-ID
 phase1_high_conf_reid_require_lost: false # Не вимагати lost_frames > 0 для re-ID
+phase1_high_conf_reid_validation_frames: 3 # Валідація на 3 кадрах для надійності
+phase1_high_conf_reid_conf_gap: 0.1      # Різниця conf >= 0.1 для перемикання
 
 # ✅ KALMAN - оптимізовано
 use_kalman: true
