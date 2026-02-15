@@ -11,33 +11,33 @@ device: "cuda"
 
 # ✅ ADAPTIVE CONFIDENCE - оптимізовано
 conf: 0.01
-conf_max: 0.15                    # Підвищено для кращої детекції
-conf_adaptive_rate: 25            # Швидша адаптація
+conf_max: 0.1                    # Підвищено для кращої детекції
+conf_adaptive_rate: 30            # Швидша адаптація
 iou_threshold: 0.2
 
 # ✅ VPE - оптимізовано
 vpe_step: 10
 max_vpe: 50
 vpe_conf_threshold: 0.05
-vpe_conf_max: 0.25                # Підвищено для адаптивності
-adaptive_rate: 400                # Швидша VPE адаптація
+vpe_conf_max: 0.2                # Підвищено для адаптивності
+adaptive_rate: 500                # Швидша VPE адаптація
 
-max_lost_frames: 20               # Більше tolerance
+max_lost_frames: 15               # Більше tolerance
 warmup_frames: 0                  # Warmup вимкнено
 
 # ✅ Phase 2 DIoU - оптимізовано
-phase2_diou_threshold: -0.1       # Більш толерантний
+phase2_diou_threshold: -0.0       # Більш толерантний
 phase2_switch_validation_frames: 3  # Очікувати 3 кадри перед перемиканням
 #waiting_reinit_conf_threshold: 0.35
 waiting_reinit_conf_threshold: 1.0
-waiting_reinit_diou_threshold: -0.6
+waiting_reinit_diou_threshold: -0.5
 
 # ✅ Phase 3 DIoU - оптимізовано
-reinit_conf_threshold: 0.25       # Нижчий поріг для легшого reinit
-reinit_diou_threshold: -0.7       # Більш толерантний DIoU
-reinit_diou_max: -0.95
-reinit_adaptive_rate: 20          # Швидша адаптація
-phase3_redetection_validation_frames: 3  # ✅ Валідація увімкнена
+reinit_conf_threshold: 0.3       # Нижчий поріг для легшого reinit
+reinit_diou_threshold: -0.6       # Більш толерантний DIoU
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 25          # Швидша адаптація
+phase3_redetection_validation_frames: 0  # ✅ Валідація увімкнена
 
 # ✅ Phase 1 High Confidence Re-ID - оптимізовано
 phase1_high_conf_reid_threshold: 0.9     # Екстремально висока впевненість для override
@@ -48,22 +48,22 @@ phase1_high_conf_reid_conf_gap: 0.1      # Різниця conf >= 0.1 для п�
 
 # ✅ KALMAN - оптимізовано
 use_kalman: true
-use_samurai_kalman: true
-kalman_process_noise: 0.005       # Компромісний між швидкістю та стабільністю
-kalman_measurement_noise: 0.001   # Трохи більше довіри до вимірювань
+#use_samurai_kalman: true
+kalman_process_noise: 0.001       # Компромісний між швидкістю та стабільністю
+kalman_measurement_noise: 0.0001   # Трохи більше довіри до вимірювань
 
 # ✅ DUAL MEMORY VPE - оптимізовано
 use_dual_memory_vpe: true
-dual_long_term_capacity: 25       # Більша довготермінова пам'ять
-dual_long_term_quality_threshold: 0.65
-dual_long_term_weight: 0.6        # Більша вага LT
-dual_short_term_capacity: 12
-dual_short_term_weight: 0.4
-dual_temporal_decay: 0.92         # Повільніший decay
-dual_update_long_term_every: 40   # Частіше оновлення LT
+dual_long_term_capacity: 20       # Більша довготермінова пам'ять
+dual_long_term_quality_threshold: 0.6
+dual_long_term_weight: 0.5        # Більша вага LT
+dual_short_term_capacity: 10
+dual_short_term_weight: 0.5
+dual_temporal_decay: 0.9         # Повільніший decay
+dual_update_long_term_every: 50   # Частіше оновлення LT
 dual_replace_worst_lt: true
 dual_use_anchor: true
-dual_anchor_weight: 0.15          # Більша вага anchor
+dual_anchor_weight: 0.1          # Більша вага anchor
 
 verbose: false
 debug_frame_step: 10000

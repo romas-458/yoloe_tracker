@@ -27,7 +27,9 @@ warmup_frames: 0
 
 # ✅ Phase 2 DIoU
 phase2_diou_threshold: -0.0
-waiting_reinit_conf_threshold: 0.4
+#waiting_reinit_conf_threshold: 0.4
+phase2_switch_validation_frames: 3  # Очікувати 3 кадри перед перемиканням
+waiting_reinit_conf_threshold: 1.0
 waiting_reinit_diou_threshold: -0.5
 
 # ✅ Phase 3 DIoU
@@ -39,6 +41,7 @@ phase3_redetection_validation_frames: 0
 
 # ✅ KALMAN
 use_kalman: true
+#use_samurai_kalman: true
 kalman_process_noise: 0.001
 kalman_measurement_noise: 0.0001
 
@@ -56,4 +59,4 @@ dual_use_anchor: true
 dual_anchor_weight: 0.1
 
 verbose: false
-debug_frame_step: 100
+debug_frame_step: 10000

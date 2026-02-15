@@ -53,5 +53,5 @@ use_samurai_kalman: false
 # ❌ DUAL MEMORY ВИМКНЕНО
 use_dual_memory_vpe: false
 
-verbose: true
+verbose: false
 debug_frame_step: 10

@@ -4,8 +4,8 @@
 # Compatible with both bash and sh
 
 DATASET_PATH="/home/roman/Projects/phd/myric/data"
-TEST_LIST="lasot_ablation_test_list_short.txt"
-OUTPUT_DIR="results_ablation"
+TEST_LIST="lasot_ablation_test_list.txt"
+OUTPUT_DIR="results_ablation5"
 
 echo "========================================="
 echo "YOLOe-VP-IoU Ablation Study"
@@ -43,8 +43,7 @@ for config in yoloe-vp-iou/ablation/A1_baseline.yaml \
         --tracker-config "$config" \
         --dataset lasot \
         --test-list "$TEST_LIST" \
-        --num-frames 100 \
-        --visualize
+        --num-frames 10000
 
     if [ $? -eq 0 ]; then
         echo "✓ $exp_name completed successfully"

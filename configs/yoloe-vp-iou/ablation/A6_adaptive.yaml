@@ -47,4 +47,4 @@ kalman_measurement_noise: 0.0001
 use_dual_memory_vpe: false
 
 verbose: false
-debug_frame_step: 100
+debug_frame_step: 10000
