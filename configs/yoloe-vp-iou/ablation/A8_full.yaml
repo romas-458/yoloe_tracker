@@ -27,6 +27,7 @@ warmup_frames: 0                  # Warmup вимкнено
 
 # ✅ Phase 2 DIoU - оптимізовано
 phase2_diou_threshold: -0.1       # Більш толерантний
+phase2_switch_validation_frames: 3  # Очікувати 3 кадри перед перемиканням
 #waiting_reinit_conf_threshold: 0.35
 waiting_reinit_conf_threshold: 1.0
 waiting_reinit_diou_threshold: -0.6
@@ -47,6 +48,7 @@ phase1_high_conf_reid_conf_gap: 0.1      # Різниця conf >= 0.1 для п�
 
 # ✅ KALMAN - оптимізовано
 use_kalman: true
+use_samurai_kalman: true
 kalman_process_noise: 0.005       # Компромісний між швидкістю та стабільністю
 kalman_measurement_noise: 0.001   # Трохи більше довіри до вимірювань
 
