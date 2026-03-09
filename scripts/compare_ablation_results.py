@@ -43,8 +43,8 @@ def main():
 
     results_dir = Path(args.results_dir)
 
-    # Find all ablation result directories
-    result_dirs = sorted(results_dir.glob('results_A*'))
+    # Find all ablation result directories (both A-series and B-series)
+    result_dirs = sorted(results_dir.glob('results_[AB]*'))
 
     # Filter only directories
     result_dirs = [d for d in result_dirs if d.is_dir()]
@@ -59,6 +59,7 @@ def main():
     # Collect data
     data = []
     experiment_names = {
+        # A-series
         'A1': 'Baseline (IoU only)',
         'A2': '+VPE',
         'A3': '+Kalman',
@@ -66,7 +67,17 @@ def main():
         'A5': '+DIoU',
         'A6': '+Adaptive',
         'A7': '+DualMemory',
-        'A8': 'Full (optimized)'
+        'A8': 'Full (optimized)',
+        # B-series
+        'B1': 'Baseline (IoU only)',
+        'B2': '+VPE',
+        'B3': '+Kalman',
+        'B4': '+VPE+Kalman',
+        'B5': '+DIoU Phase2',
+        'B6': '+DIoU Phase2+3',
+        'B7': '+Adaptive',
+        'B8': '+DualMemory',
+        'B9': 'Full (Phase 1 Re-ID)'
     }
 
     for result_dir in result_dirs:
