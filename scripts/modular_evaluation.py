@@ -766,14 +766,29 @@ class ModularEvaluator:
                     cv2.putText(image, line, (10, y_pos),
                                font, font_size, text_color, font_thickness)
 
-        # Last valid bbox (Фаза 2 - пошук/очікування) - помаранчевий
+        # Last valid bbox (Phase 2 і Phase 3 - об'єкт втрачено) - помаранчевий
         if tracking_info and tracking_info.get('last_valid_bbox'):
             last_valid = tracking_info['last_valid_bbox']
             x, y, w, h = [int(v) for v in last_valid]
             lost_frames = tracking_info.get('lost_frames', 0)
             cv2.rectangle(image, (x, y), (x + w, y + h), (0, 165, 255), 2)  # Помаранчевий
-            cv2.putText(image, f"Searching (lost={lost_frames})", (x, y - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+            cv2.putText(image, f"Last Valid (lost={lost_frames})", (x, y - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+        # Phase 3 reference bbox (bbox з яким порівнюються кандидати) - жовтий пунктир
+        if tracking_info and tracking_info.get('phase3_reference_bbox'):
+            ref = tracking_info['phase3_reference_bbox']
+            ref_mode = tracking_info.get('phase3_ref_mode', '')
+            x, y, w, h = [int(v) for v in ref]
+            # Малювати тільки якщо відрізняється від last_valid (інакше зайве накладання)
+            last_valid = tracking_info.get('last_valid_bbox')
+            is_same_as_last_valid = (last_valid is not None and
+                                     abs(last_valid[0] - ref[0]) < 2 and
+                                     abs(last_valid[1] - ref[1]) < 2)
+            if not is_same_as_last_valid:
+                self._draw_dashed_rectangle(image, (x, y), (x + w, y + h), (0, 255, 255), 2)  # Жовтий
+                cv2.putText(image, f"Ref ({ref_mode})", (x, y + h + 15),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
         # Predicted bbox (активний трекінг)
         if pred_bbox:

@@ -55,7 +55,7 @@ kalman_measurement_noise: 0.0001   # Трохи більше довіри до �
 # ✅ DUAL MEMORY VPE - оптимізовано
 use_dual_memory_vpe: true
 dual_long_term_capacity: 20       # Більша довготермінова пам'ять
-dual_long_term_quality_threshold: 0.6
+dual_long_term_quality_threshold: 0.7
 dual_long_term_weight: 0.5        # Більша вага LT
 dual_short_term_capacity: 10
 dual_short_term_weight: 0.5

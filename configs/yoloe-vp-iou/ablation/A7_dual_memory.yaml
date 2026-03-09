@@ -10,13 +10,13 @@ imgsz: 640
 device: "cuda"
 
 # ✅ ADAPTIVE CONFIDENCE
-conf: 0.01
+conf: 0.05
 conf_max: 0.1
 conf_adaptive_rate: 30
 iou_threshold: 0.2
 
 # ✅ VPE
-vpe_step: 10
+vpe_step: 7
 max_vpe: 50
 vpe_conf_threshold: 0.05
 vpe_conf_max: 0.2
@@ -26,7 +26,7 @@ max_lost_frames: 15
 warmup_frames: 0
 
 # ✅ Phase 2 DIoU
-phase2_diou_threshold: -0.0
+phase2_diou_threshold: -0.1
 #waiting_reinit_conf_threshold: 0.4
 phase2_switch_validation_frames: 3  # Очікувати 3 кадри перед перемиканням
 waiting_reinit_conf_threshold: 1.0
@@ -37,7 +37,7 @@ reinit_conf_threshold: 0.3
 reinit_diou_threshold: -0.6
 reinit_diou_max: -0.9
 reinit_adaptive_rate: 25
-phase3_redetection_validation_frames: 0
+phase3_redetection_validation_frames: 3
 
 # ✅ KALMAN
 use_kalman: true

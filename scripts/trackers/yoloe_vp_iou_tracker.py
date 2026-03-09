@@ -428,12 +428,20 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.reinit_adaptive_rate = reinit_adaptive_rate
         self.reinit_conf_threshold = reinit_conf_threshold
         self.phase3_redetection_validation_frames = phase3_redetection_validation_frames
+        self.phase3_vpe_freeze_frames = kwargs.get('phase3_vpe_freeze_frames', 0)
+        # Режим вибору reference bbox для Phase 3 порівнянь:
+        #   'last_valid'    — остання детектована позиція (default, стабільно)
+        #   'kalman_phase2' — остання Kalman предикція з Phase 2 (враховує рух при виході з Phase 2)
+        #   'kalman_phase3' — поточна Kalman предикція у Phase 3 (найсвіжіша, але може дрейфувати)
+        self.phase3_ref_mode = kwargs.get('phase3_ref_mode', 'last_valid')
 
         # Phase 1 High Confidence Re-ID
         self.phase1_high_conf_reid_threshold = kwargs.get('phase1_high_conf_reid_threshold', 0.9)
         self.phase1_high_conf_reid_iou = kwargs.get('phase1_high_conf_reid_iou', 0.3)
+        self.phase1_high_conf_reid_diou = kwargs.get('phase1_high_conf_reid_diou', None)  # якщо задано — використовує DIoU замість IoU
         self.phase1_high_conf_reid_require_lost = kwargs.get('phase1_high_conf_reid_require_lost', False)
         self.phase1_high_conf_reid_validation_frames = kwargs.get('phase1_high_conf_reid_validation_frames', 0)
+        self.phase1_high_conf_reid_validation_skip = kwargs.get('phase1_high_conf_reid_validation_skip', 0)
         self.phase1_high_conf_reid_conf_gap = kwargs.get('phase1_high_conf_reid_conf_gap', 0.0)
         self.use_kalman = use_kalman
         self.kalman_process_noise = kalman_process_noise
@@ -534,11 +542,18 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Phase 3 Redetection Validation Gate
         self.in_phase3_validation = False  # Чи ми в режимі validation після Phase 3 реініціалізації
         self.phase3_validation_consecutive_successes = 0  # Лічильник послідовних успішних фреймів у validation режимі
+        self.phase3_validation_failure_count = 0  # Лічильник невдалих кадрів під час validation (незалежний від lost_frames)
         self.phase3_validation_bbox = None  # Bbox що перевіряється у validation режимі
+        self.phase3_reference_bbox = None  # Bbox з яким порівнюються кандидати (для візуалізації)
+        self.phase3_kalman_exit_bbox = None  # Остання Kalman предикція з Phase 2 (xyxy)
+
+        # Phase 3 VPE Freeze: блокувати збір VPE після Phase 3 reinit
+        self.phase3_vpe_freeze_counter = 0  # Кількість кадрів що залишилось блокувати VPE
 
         # Phase 1 High Confidence Re-ID Validation
         self.phase1_high_conf_reid_candidate = None  # Кандидат для high-conf re-ID (dict з bbox, conf, iou)
-        self.phase1_high_conf_reid_validation_count = 0  # Лічильник послідовних успішних валідацій
+        self.phase1_high_conf_reid_validation_count = 0  # Лічильник успішних перевірок
+        self.phase1_high_conf_reid_skip_counter = 0    # Кадрів залишилось пропустити (0 = кадр перевірки)
 
         # Phase 2 Switch Validation
         self.phase2_pending_candidate = None  # Pending кандидат для перемикання в Phase 2 (dict з bbox, conf, diou)
@@ -809,6 +824,12 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.search_candidates = []
         self.current_frame_detections = []
 
+        # Зменшити VPE freeze лічильник якщо активний
+        if self.phase3_vpe_freeze_counter > 0:
+            self.phase3_vpe_freeze_counter -= 1
+            if self.verbose and self.phase3_vpe_freeze_counter == 0:
+                print(f"🔓 Кадр {self.frame_count}: Phase 3 VPE freeze знято, збір VPE відновлено")
+
         # Перевірка завершення warmup періоду
         if self.in_warmup and self.frame_count >= self.warmup_frames:
             self.in_warmup = False
@@ -873,6 +894,16 @@ class YOLOeVPIoUTracker(BaseTracker):
             if len(results) == 0 or len(results[0].boxes) == 0:
                 # Немає detections
                 self.lost_frames += 1
+
+                # ⭐ Скинути Phase 3 validation якщо немає detections взагалі
+                # (потрібно строго N послідовних кадрів БЕЗ пропусків)
+                if self.in_phase3_validation:
+                    if self.verbose:
+                        print(f"❌ Кадр {self.frame_count}: [PHASE 3 VAL] скасовано через відсутність detections (consecutive={self.phase3_validation_consecutive_successes})")
+                    self.in_phase3_validation = False
+                    self.phase3_validation_bbox = None
+                    self.phase3_validation_consecutive_successes = 0
+                    self.phase3_validation_failure_count = 0
 
                 if self.verbose:
                     print(f"⚠️  Кадр {self.frame_count}: No detections (lost={self.lost_frames}/{self.max_lost_frames})")
@@ -990,15 +1021,20 @@ class YOLOeVPIoUTracker(BaseTracker):
                     conf_gap_threshold = current_best_conf + self.phase1_high_conf_reid_conf_gap
                     if (box_conf_temp >= self.phase1_high_conf_reid_threshold and
                         box_conf_temp > conf_gap_threshold):
-                        # Обчислити IoU з last_valid_bbox
-                        iou_with_original = self._compute_iou(self.last_valid_bbox, box_xyxy_temp)
+                        # Обчислити DIoU або IoU з last_valid_bbox
+                        if self.phase1_high_conf_reid_diou is not None:
+                            proximity = self._compute_diou(self.last_valid_bbox, box_xyxy_temp)
+                            passes_proximity = proximity >= self.phase1_high_conf_reid_diou
+                        else:
+                            proximity = self._compute_iou(self.last_valid_bbox, box_xyxy_temp)
+                            passes_proximity = proximity >= self.phase1_high_conf_reid_iou
 
-                        if iou_with_original >= self.phase1_high_conf_reid_iou:
+                        if passes_proximity:
                             high_conf_candidates.append({
                                 'idx': idx,
                                 'bbox': box_xyxy_temp,
                                 'conf': box_conf_temp,
-                                'iou': iou_with_original
+                                'iou': proximity
                             })
 
                 # Якщо знайдено high-conf кандидата
@@ -1008,67 +1044,90 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                     # Перевірка чи потрібна temporal validation
                     if self.phase1_high_conf_reid_validation_frames > 0:
-                        # ===== TEMPORAL VALIDATION MODE =====
+                        # ===== TEMPORAL VALIDATION MODE (з підтримкою skip) =====
+                        skip = self.phase1_high_conf_reid_validation_skip
+
                         # Перевірити чи це той самий кандидат що і раніше
                         is_same_candidate = False
                         if self.phase1_high_conf_reid_candidate is not None:
                             prev_bbox = self.phase1_high_conf_reid_candidate['bbox']
                             curr_bbox = best_high_conf['bbox']
                             candidate_iou = self._compute_iou(prev_bbox, curr_bbox)
-                            # Вважаємо що це той самий кандидат якщо IoU > 0.5
                             is_same_candidate = candidate_iou > 0.5
 
                         if is_same_candidate:
-                            # Продовжити валідацію того самого кандидата
-                            self.phase1_high_conf_reid_validation_count += 1
-                            if self.verbose:
-                                print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID валідація {self.phase1_high_conf_reid_validation_count}/{self.phase1_high_conf_reid_validation_frames}")
-                                print(f"   Кандидат: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
-
-                            # Перевірити чи досягнуто порогу валідації
-                            if self.phase1_high_conf_reid_validation_count >= self.phase1_high_conf_reid_validation_frames:
-                                # Валідація успішна - перемкнутися!
+                            if self.phase1_high_conf_reid_skip_counter > 0:
+                                # ===== SKIP FRAME: пропускаємо, тільки оновлюємо позицію =====
+                                self.phase1_high_conf_reid_skip_counter -= 1
+                                # Оновлюємо позицію кандидата (слідкуємо за рухом)
+                                self.phase1_high_conf_reid_candidate = best_high_conf
                                 if self.verbose:
-                                    print(f"✅ Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override! (валідація пройдена)")
-                                    print(f"   Поточний: conf={current_best_conf:.3f}, best_iou={best_iou:.3f}")
-                                    print(f"   Новий: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
-                                    print(f"   Переключення на high-conf детекцію (Δconf={best_high_conf['conf']-current_best_conf:.3f})")
+                                    print(f"⏭️  Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID пропуск ({self.phase1_high_conf_reid_skip_counter} залишилось), count={self.phase1_high_conf_reid_validation_count}/{self.phase1_high_conf_reid_validation_frames}")
+                            else:
+                                # ===== CHECK FRAME: перевіряємо та рахуємо =====
+                                self.phase1_high_conf_reid_validation_count += 1
+                                # Оновити збережений кандидат
+                                self.phase1_high_conf_reid_candidate = best_high_conf
+                                if self.verbose:
+                                    skip_info = f", skip={skip}" if skip > 0 else ""
+                                    print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID перевірка {self.phase1_high_conf_reid_validation_count}/{self.phase1_high_conf_reid_validation_frames}{skip_info}")
+                                    print(f"   Кандидат: conf={best_high_conf['conf']:.3f}, proximity={best_high_conf['iou']:.3f}")
 
-                                # Примусово встановити як best match
-                                best_iou_idx = best_high_conf['idx']
-                                best_iou = best_high_conf['iou']
-                                high_conf_override = True
+                                if self.phase1_high_conf_reid_validation_count >= self.phase1_high_conf_reid_validation_frames:
+                                    # Валідація успішна - перемкнутися!
+                                    if self.verbose:
+                                        print(f"✅ Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override! (валідація пройдена)")
+                                        print(f"   Поточний: conf={current_best_conf:.3f}, best_iou={best_iou:.3f}")
+                                        print(f"   Новий: conf={best_high_conf['conf']:.3f}, proximity={best_high_conf['iou']:.3f}")
+                                        print(f"   Переключення на high-conf детекцію (Δconf={best_high_conf['conf']-current_best_conf:.3f})")
 
-                                # Скинути валідацію
-                                self.phase1_high_conf_reid_candidate = None
-                                self.phase1_high_conf_reid_validation_count = 0
+                                    best_iou_idx = best_high_conf['idx']
+                                    best_iou = best_high_conf['iou']
+                                    high_conf_override = True
+
+                                    # Скинути валідацію
+                                    self.phase1_high_conf_reid_candidate = None
+                                    self.phase1_high_conf_reid_validation_count = 0
+                                    self.phase1_high_conf_reid_skip_counter = 0
+                                else:
+                                    # Перевірка пройдена, але ще не досягнуто порогу
+                                    # Запустити skip-період перед наступною перевіркою
+                                    self.phase1_high_conf_reid_skip_counter = skip
                         else:
                             # Новий кандидат - почати валідацію спочатку
                             self.phase1_high_conf_reid_candidate = best_high_conf
                             self.phase1_high_conf_reid_validation_count = 1
+                            self.phase1_high_conf_reid_skip_counter = skip  # Перший skip-період
                             if self.verbose:
-                                print(f"🆕 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID новий кандидат виявлено")
-                                print(f"   Кандидат: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
-                                print(f"   Початок валідації 1/{self.phase1_high_conf_reid_validation_frames}")
+                                skip_info = f", skip={skip}" if skip > 0 else ""
+                                print(f"🆕 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID новий кандидат: 1/{self.phase1_high_conf_reid_validation_frames}{skip_info}")
+                                print(f"   conf={best_high_conf['conf']:.3f}, proximity={best_high_conf['iou']:.3f}")
                     else:
                         # ===== IMMEDIATE MODE (без validation) =====
                         if self.verbose:
                             print(f"🔄 Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID Override!")
                             print(f"   Поточний: conf={current_best_conf:.3f}, best_iou={best_iou:.3f}")
-                            print(f"   Новий: conf={best_high_conf['conf']:.3f}, IoU={best_high_conf['iou']:.3f} з original")
+                            print(f"   Новий: conf={best_high_conf['conf']:.3f}, proximity={best_high_conf['iou']:.3f}")
                             print(f"   Переключення на high-conf детекцію (Δconf={best_high_conf['conf']-current_best_conf:.3f})")
 
-                        # Примусово встановити як best match
                         best_iou_idx = best_high_conf['idx']
                         best_iou = best_high_conf['iou']
                         high_conf_override = True
                 else:
-                    # Кандидатів не знайдено - скинути валідацію якщо була
+                    # Кандидатів не знайдено на цьому кадрі
                     if self.phase1_high_conf_reid_candidate is not None:
-                        if self.verbose:
-                            print(f"❌ Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID валідація скинута (кандидат втрачено)")
-                        self.phase1_high_conf_reid_candidate = None
-                        self.phase1_high_conf_reid_validation_count = 0
+                        if self.phase1_high_conf_reid_skip_counter > 0:
+                            # ===== SKIP FRAME без детекції: пропускаємо (не скидаємо) =====
+                            self.phase1_high_conf_reid_skip_counter -= 1
+                            if self.verbose:
+                                print(f"⏭️  Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID пропуск без детекції ({self.phase1_high_conf_reid_skip_counter} залишилось)")
+                        else:
+                            # CHECK FRAME без детекції: скидаємо валідацію
+                            if self.verbose:
+                                print(f"❌ Кадр {self.frame_count}: [PHASE 1] High-Conf Re-ID скинуто (кандидат не знайдено на кадрі перевірки)")
+                            self.phase1_high_conf_reid_candidate = None
+                            self.phase1_high_conf_reid_validation_count = 0
+                            self.phase1_high_conf_reid_skip_counter = 0
 
             # Перевірка IoU threshold та розміру (або high_conf_override)
             if best_iou >= self.iou_threshold or high_conf_override:
@@ -1113,6 +1172,16 @@ class YOLOeVPIoUTracker(BaseTracker):
                 self.lost_frames = 0  # Reset counter
                 self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
+                # ⭐ Скинути Phase 3 validation якщо вона була активна
+                # (Phase 1 IoU commit перериває Phase 3 validation, тому скидаємо лічильник)
+                if self.in_phase3_validation:
+                    if self.verbose:
+                        print(f"   🔄 [PHASE 1] Phase 3 validation скинута (Phase 1 commit перериває validation)")
+                    self.in_phase3_validation = False
+                    self.phase3_validation_bbox = None
+                    self.phase3_validation_consecutive_successes = 0
+                    self.phase3_validation_failure_count = 0
+
                 # Скасувати Phase 2 pending якщо справжній об'єкт з'явився
                 if self.phase2_pending_candidate is not None:
                     if self.verbose:
@@ -1129,18 +1198,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                     if self.verbose and len(self.current_frame_detections) > 0:
                         print(f"   📊 Зібрано proximity для {len(self.current_frame_detections)} детекцій")
 
-                # ⭐ Phase 3 Validation Gate: лічимо послідовні успішні фрейми
-                if self.in_phase3_validation:
-                    self.phase3_validation_consecutive_successes += 1
-                    if self.verbose:
-                        print(f"   📊 Validation: успішний фрейм {self.phase3_validation_consecutive_successes}/{self.phase3_redetection_validation_frames}")
-
-                    # Якщо накопили достатня кількість послідовних успішних
-                    if self.phase3_validation_consecutive_successes >= self.phase3_redetection_validation_frames:
-                        self.in_phase3_validation = False
-                        self.phase3_validation_bbox = None
-                        if self.verbose:
-                            print(f"   ✅ Phase 3 Validation PASSED - реініціалізація підтверджена, повертаємось до Phase 1")
+                # (Phase 3 validation відбувається всередині Phase 3, не тут)
 
                 # Зберегти candidates для візуалізації
                 self.top_candidates = []
@@ -1204,7 +1262,10 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                 # Зібрати VPE якщо час (або pending) та conf достатня
                 # Під час warmup збирати кожен кадр
-                should_collect_vpe = self.in_warmup or (self.frame_count % self.vpe_step == 0) or self.vpe_pending
+                # Блокувати якщо Phase 3 VPE freeze активний
+                should_collect_vpe = (self.phase3_vpe_freeze_counter == 0) and (
+                    self.in_warmup or (self.frame_count % self.vpe_step == 0) or self.vpe_pending
+                )
 
                 if should_collect_vpe:
                     # Під час warmup використовувати мінімальний поріг (той що використовується для детекції)
@@ -1232,21 +1293,6 @@ class YOLOeVPIoUTracker(BaseTracker):
 
             else:
                 # IoU < threshold - об'єкт не знайдено за geometric matching
-
-                # ⭐ Phase 3 Validation Gate: скасування валідації при невдачі
-                if self.in_phase3_validation:
-                    self.phase3_validation_consecutive_successes = 0  # Скинути лічильник при невдачі
-
-                    # Якщо validation тривалий час (більше validation_frames кадрів), скасуємо validation
-                    # і повертаємось до попередньої bbox
-                    if self.lost_frames >= self.phase3_redetection_validation_frames:
-                        self.in_phase3_validation = False
-                        self.phase3_validation_bbox = None
-                        if self.verbose:
-                            print(f"   ⚠️  Phase 3 Validation FAILED (lost_frames >= {self.phase3_redetection_validation_frames}) - реініціалізація скасована!")
-                            print(f"   🔄 Повертаємось до Phase 3 recovery режиму")
-                    elif self.verbose:
-                        print(f"   ❌ Phase 3 Validation: невдалий фрейм - лічильник скинутий (lost_frames={self.lost_frames})")
 
                 self.lost_frames += 1
 
@@ -1364,6 +1410,13 @@ class YOLOeVPIoUTracker(BaseTracker):
                             self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
                             self.search_candidates = []  # Очистити кандидатів (Phase 2 - знайдено)
 
+                            # ⭐ Скинути Phase 3 validation (Phase 2 commit перериває її)
+                            if self.in_phase3_validation:
+                                self.in_phase3_validation = False
+                                self.phase3_validation_bbox = None
+                                self.phase3_validation_consecutive_successes = 0
+                                self.phase3_validation_failure_count = 0
+
                             # Скинути pending стан
                             self.phase2_pending_candidate = None
                             self.phase2_pending_validation_count = 0
@@ -1468,6 +1521,13 @@ class YOLOeVPIoUTracker(BaseTracker):
                         self.last_valid_bbox = self.current_bbox
                         self.lost_frames = 0  # Reset counter
 
+                        # ⭐ Скинути Phase 3 validation (Phase 2 waiting_reinit commit перериває її)
+                        if self.in_phase3_validation:
+                            self.in_phase3_validation = False
+                            self.phase3_validation_bbox = None
+                            self.phase3_validation_consecutive_successes = 0
+                            self.phase3_validation_failure_count = 0
+
                         # ⭐ Заповнити top_candidates для візуалізації на першому фреймі після відновлення
                         self.top_candidates = []
                         for idx, box in enumerate(boxes):
@@ -1531,6 +1591,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                         x, y, w, h = kalman_prediction  # xywh
                         self.current_bbox = [x, y, x + w, y + h]  # convert to xyxy
                         self.last_bbox_is_kalman_only = True  # Відмітити, що це не валідовано детекціями
+                        # ⭐ Зберегти останню Phase 2 Kalman предикцію для Phase 3 ref
+                        self.phase3_kalman_exit_bbox = self.current_bbox[:]
                         return True, kalman_prediction
                     else:
                         # Не оновлюємо bbox, повертаємо False (втрачений для евалюації)
@@ -1542,11 +1604,87 @@ class YOLOeVPIoUTracker(BaseTracker):
                     # ФАЗА 3: РЕІДЕНТИФІКАЦІЯ
                     # ========================================
 
+                    # ⭐ Phase 3 Validation Gate: перевірка pending кандидата
+                    if self.in_phase3_validation and self.phase3_validation_bbox is not None:
+                        # Шукаємо кандидата в поточних детекціях
+                        best_val_iou = 0.0
+                        best_val_box = None
+                        best_val_conf = 0.0
+                        if boxes is not None:
+                            for box in boxes:
+                                box_xyxy = box.xyxy[0].cpu().numpy()
+                                val_iou = self._compute_iou(self.phase3_validation_bbox, box_xyxy)
+                                if val_iou > best_val_iou:
+                                    best_val_iou = val_iou
+                                    best_val_box = box_xyxy
+                                    best_val_conf = float(box.conf[0].cpu().numpy())
+
+                        if best_val_iou >= self.iou_threshold:
+                            # Кандидат видимий — оновити його позицію та лічильник
+                            self.phase3_validation_bbox = best_val_box.tolist()
+                            self.phase3_validation_consecutive_successes += 1
+                            if self.verbose:
+                                print(f"📊 Кадр {self.frame_count}: [PHASE 3 VAL] {self.phase3_validation_consecutive_successes}/{self.phase3_redetection_validation_frames}, IoU={best_val_iou:.3f}, conf={best_val_conf:.3f}")
+
+                            if self.phase3_validation_consecutive_successes >= self.phase3_redetection_validation_frames:
+                                # COMMIT: validation пройдена, переходимо до Phase 1
+                                val_bbox = best_val_box
+                                detected_bbox_xywh = [val_bbox[0], val_bbox[1], val_bbox[2] - val_bbox[0], val_bbox[3] - val_bbox[1]]
+                                if self.use_kalman and self.kalman is not None:
+                                    smoothed = self.kalman.update(detected_bbox_xywh)
+                                    x, y, w, h = smoothed
+                                    self.current_bbox = [x, y, x + w, y + h]
+                                else:
+                                    self.current_bbox = best_val_box.tolist()
+                                self.last_valid_bbox = self.current_bbox
+                                self.lost_frames = 0
+                                self.last_bbox_is_kalman_only = False
+                                self.in_phase3_validation = False
+                                self.phase3_validation_consecutive_successes = 0
+                                self.phase3_validation_failure_count = 0
+                                self.phase3_validation_bbox = None
+                                self.vpe_pending = True  # Зібрати VPE після підтвердження
+                                if self.verbose:
+                                    print(f"✅ Кадр {self.frame_count}: [PHASE 3 VAL] PASSED — об'єкт підтверджено, повертаємось до Phase 1")
+                                x1, y1, x2, y2 = self.current_bbox
+                                return True, [x1, y1, x2 - x1, y2 - y1]
+                            else:
+                                return False, None  # Продовжуємо валідацію
+                        else:
+                            # Кандидат не видимий — невдача: скасувати validation негайно
+                            # (потрібно строго N ПОСЛІДОВНИХ кадрів, будь-яка невдача скидає лічильник)
+                            if self.verbose:
+                                print(f"❌ Кадр {self.frame_count}: [PHASE 3 VAL] невдача (consecutive={self.phase3_validation_consecutive_successes}) — validation скасовано, Phase 3 шукає знову")
+                            self.in_phase3_validation = False
+                            self.phase3_validation_bbox = None
+                            self.phase3_validation_consecutive_successes = 0
+                            self.phase3_validation_failure_count = 0
+                            # Fall through до нормального Phase 3 search (шукаємо кандидата знову)
+
                     # Очистити попередні відкинуті кандидати
                     self.rejected_candidates = []
 
                     # Обчислити адаптивний DIoU поріг для Phase 3
                     phase3_current_threshold = self._get_adaptive_diou_threshold()
+
+                    # ⭐ Визначити reference bbox для Phase 3 порівнянь (залежно від phase3_ref_mode):
+                    if self.phase3_ref_mode == 'kalman_phase3' and self.use_kalman and kalman_prediction is not None:
+                        # Поточна Kalman предикція у Phase 3 (найсвіжіша, але може дрейфувати)
+                        kx, ky, kw, kh = kalman_prediction
+                        phase3_ref_bbox = [kx, ky, kx + kw, ky + kh]  # xywh → xyxy
+                        ref_src_log = "kalman_phase3"
+                    elif self.phase3_ref_mode == 'kalman_phase2' and self.phase3_kalman_exit_bbox is not None:
+                        # Остання Kalman предикція з Phase 2 (стабільніша ніж phase3, враховує рух)
+                        phase3_ref_bbox = self.phase3_kalman_exit_bbox
+                        ref_src_log = "kalman_phase2"
+                    else:
+                        # 'last_valid' або fallback: остання детектована позиція
+                        phase3_ref_bbox = self.last_valid_bbox
+                        ref_src_log = "last_valid" + ("" if self.phase3_ref_mode == 'last_valid' else " (fallback)")
+                    self.phase3_reference_bbox = phase3_ref_bbox  # Зберегти для візуалізації
+                    if self.verbose:
+                        rx1, ry1, rx2, ry2 = phase3_ref_bbox
+                        print(f"   📍 [PHASE 3] ref_bbox [{ref_src_log}]: [{rx1:.1f},{ry1:.1f},{rx2:.1f},{ry2:.1f}]")
 
                     # Зберегти всі detections для візуалізації з інформацією про статус
                     self.search_candidates = []
@@ -1554,13 +1692,18 @@ class YOLOeVPIoUTracker(BaseTracker):
                         box_xyxy = box.xyxy[0].cpu().numpy()
                         box_conf = float(box.conf[0].cpu().numpy())
                         x1, y1, x2, y2 = box_xyxy
-                        diou = self._compute_diou(self.last_valid_bbox, box_xyxy) if self.last_valid_bbox else -float('inf')
+                        diou = self._compute_diou(phase3_ref_bbox, box_xyxy) if phase3_ref_bbox else -float('inf')
 
                         # Визначити статус для кожного кандидата
                         status = 'rejected'  # Default
                         if box_conf >= self.reinit_conf_threshold:
-                            status = 'accepted'  # High-conf reinit
-                        elif diou >= phase3_current_threshold:
+                            # High-conf reinit: також перевіряємо DIoU якщо заданий
+                            diou_ok = (self.reinit_diou_threshold <= -1.0 or
+                                       not self.last_valid_bbox or
+                                       diou >= self.reinit_diou_threshold)
+                            if diou_ok:
+                                status = 'accepted'  # High-conf + DIoU reinit
+                        if status == 'rejected' and diou >= phase3_current_threshold:
                             status = 'accepted'  # DIoU-based reinit
 
                         self.search_candidates.append({
@@ -1579,6 +1722,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                         for idx, box in enumerate(boxes):
                             box_conf = float(box.conf[0].cpu().numpy())
                             if box_conf >= self.reinit_conf_threshold:
+                                # ⭐ Також перевіряємо DIoU якщо reinit_diou_threshold заданий
+                                if self.reinit_diou_threshold > -1.0 and phase3_ref_bbox:
+                                    box_xyxy_temp = box.xyxy[0].cpu().numpy()
+                                    diou_temp = self._compute_diou(phase3_ref_bbox, box_xyxy_temp)
+                                    if diou_temp < self.reinit_diou_threshold:
+                                        continue  # DIoU занадто малий — пропустити
                                 if box_conf > high_conf_candidate_conf:
                                     high_conf_candidate_conf = box_conf
                                     high_conf_candidate_idx = idx
@@ -1589,94 +1738,53 @@ class YOLOeVPIoUTracker(BaseTracker):
                         box_xyxy = best_box.xyxy[0].cpu().numpy()
                         box_conf = float(best_box.conf[0].cpu().numpy())
 
-                        # Оновити bbox (з Калманом якщо увімкнено)
-                        detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
-                        if self.use_kalman and self.kalman is not None:
-                            smoothed_bbox = self.kalman.update(detected_bbox_xywh)
-                            x, y, w, h = smoothed_bbox
-                            self.current_bbox = [x, y, x + w, y + h]
-                        else:
-                            self.current_bbox = box_xyxy.tolist()
-
-                        self.last_valid_bbox = self.current_bbox
-                        self.lost_frames = 0  # Reset counter
-                        self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
-                        self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
-
-                        # ⭐ Заповнити top_candidates для візуалізації на першому фреймі після відновлення
-                        self.top_candidates = []
-                        for idx, box in enumerate(boxes):
-                            box_xyxy_tmp = box.xyxy[0].cpu().numpy()
-                            curr_box_conf = float(box.conf[0].cpu().numpy())
-                            diou_val = self._compute_diou(self.last_valid_bbox, box_xyxy_tmp)
-                            x1, y1, x2, y2 = box_xyxy_tmp
-                            is_best = (idx == high_conf_candidate_idx)
-
-                            # Визначити статус кандидата
-                            status = 'rejected'
-                            if curr_box_conf >= self.reinit_conf_threshold:
-                                status = 'accepted'
-
-                            self.top_candidates.append({
-                                'bbox': [x1, y1, x2 - x1, y2 - y1],
-                                'iou': diou_val,
-                                'diou': diou_val,
-                                'conf': curr_box_conf,
-                                'is_best_match': is_best,
-                                'size_valid': True,
-                                'type': 'phase3',
-                                'phase': 3,
-                                'status': status
-                            })
-
-                        # ⭐ Входимо у Phase 3 Validation режим
-                        self.in_phase3_validation = True
-                        self.phase3_validation_consecutive_successes = 0
-                        self.phase3_validation_bbox = self.current_bbox.copy()
-
-                        if self.verbose:
-                            kalman_suffix = " + Kalman" if self.use_kalman else ""
-                            print(f"🔄 Кадр {self.frame_count}: [PHASE 3] High-Conf Re-ID{kalman_suffix} (conf={box_conf:.3f} >= {self.reinit_conf_threshold})")
-                            print(f"   📊 Validation gate активована (потрібно {self.phase3_redetection_validation_frames} послідовних успішних фреймів)")
-
-                        # Зібрати VPE для нового bbox (якщо conf достатня)
-                        # Під час warmup використовувати мінімальний поріг
-                        if self.in_warmup:
-                            current_vpe_threshold = self._get_adaptive_conf()
-                        else:
-                            current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
-
-                        if box_conf >= current_vpe_threshold:
+                        if self.phase3_redetection_validation_frames > 0:
+                            # Зберегти кандидата для validation — НЕ оновлювати last_valid_bbox/lost_frames
+                            self.in_phase3_validation = True
+                            self.phase3_validation_consecutive_successes = 0
+                            self.phase3_validation_failure_count = 0
+                            self.phase3_validation_bbox = box_xyxy.tolist()
+                            if self.phase3_vpe_freeze_frames > 0:
+                                self.phase3_vpe_freeze_counter = self.phase3_vpe_freeze_frames
                             if self.verbose:
-                                print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                            self._collect_vpe(image, self.current_bbox, box_conf)
-                            self.vpe_pending = False  # VPE зібрано
+                                print(f"🔍 Кадр {self.frame_count}: [PHASE 3] High-Conf кандидат (conf={box_conf:.3f}), починаємо validation на {self.phase3_redetection_validation_frames} кадрів")
+                            return False, None
                         else:
-                            self.vpe_pending = True  # Встановити флаг для наступних кадрів
+                            # Validation вимкнена — миттєвий commit
+                            detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
+                            if self.use_kalman and self.kalman is not None:
+                                smoothed_bbox = self.kalman.update(detected_bbox_xywh)
+                                x, y, w, h = smoothed_bbox
+                                self.current_bbox = [x, y, x + w, y + h]
+                            else:
+                                self.current_bbox = box_xyxy.tolist()
+                            self.last_valid_bbox = self.current_bbox
+                            self.lost_frames = 0
+                            self.last_bbox_is_kalman_only = False
+                            self.search_candidates = []
                             if self.verbose:
-                                print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
-
-                        x1, y1, x2, y2 = self.current_bbox
-                        return True, [x1, y1, x2 - x1, y2 - y1]
+                                print(f"🔄 Кадр {self.frame_count}: [PHASE 3] High-Conf Re-ID (conf={box_conf:.3f} >= {self.reinit_conf_threshold})")
+                            x1, y1, x2, y2 = self.current_bbox
+                            return True, [x1, y1, x2 - x1, y2 - y1]
 
                     # Якщо встановлено reinit_diou_threshold, фільтруємо кандидатів за DIoU
                     reinit_candidate_idx = -1
                     reinit_candidate_conf = 0
                     reinit_candidate_diou = -float('inf')
 
-                    if self.reinit_diou_threshold > -1.0 and self.last_valid_bbox:
+                    if self.reinit_diou_threshold > -1.0 and phase3_ref_bbox:
                         # Обчислити адаптивний threshold на основі lost_frames
                         current_threshold = self._get_adaptive_diou_threshold()
 
-                        # Фільтрація за DIoU від last_valid_bbox
+                        # Фільтрація за DIoU від phase3_ref_bbox (Kalman або last_valid_bbox)
                         all_candidates = []  # Всі кандидати для verbose виводу
 
                         for idx, box in enumerate(boxes):
                             box_xyxy = box.xyxy[0].cpu().numpy()
                             box_conf = float(box.conf[0].cpu().numpy())
 
-                            # Обчислити DIoU з last_valid_bbox
-                            diou = self._compute_diou(self.last_valid_bbox, box_xyxy)
+                            # Обчислити DIoU з phase3_ref_bbox
+                            diou = self._compute_diou(phase3_ref_bbox, box_xyxy)
 
                             # Зберегти кандидата
                             candidate_info = {
@@ -1710,88 +1818,45 @@ class YOLOeVPIoUTracker(BaseTracker):
                             if self.reinit_diou_max < self.reinit_diou_threshold:
                                 threshold_info += f" (adaptive: frame {frames_in_phase3}/{self.reinit_adaptive_rate})"
 
-                            print(f"   🔍 Фаза 3: {len(all_candidates)} кандидатів (threshold {threshold_info}):")
+                            ref_src = "Kalman" if (self.use_kalman and kalman_prediction is not None) else "last_valid"
+                            print(f"   🔍 Фаза 3: {len(all_candidates)} кандидатів (threshold {threshold_info}, ref={ref_src}):")
                             for i, cand in enumerate(all_candidates):
                                 status = "✅ ПРИЙНЯТО" if cand['accepted'] else "❌ ВІДКИНУТО"
                                 print(f"      #{i+1}: {status} | conf={cand['conf']:.3f}, DIoU={cand['diou']:.3f}")
 
                         if reinit_candidate_idx >= 0:
-                            # Знайдено кандидата з достатнім DIoU
                             best_box = boxes[reinit_candidate_idx]
                             box_xyxy = best_box.xyxy[0].cpu().numpy()
                             box_conf = float(best_box.conf[0].cpu().numpy())
 
-                            # Оновити bbox (з Калманом якщо увімкнено)
-                            detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
-                            if self.use_kalman and self.kalman is not None:
-                                smoothed_bbox = self.kalman.update(detected_bbox_xywh)
-                                x, y, w, h = smoothed_bbox
-                                self.current_bbox = [x, y, x + w, y + h]
-                            else:
-                                self.current_bbox = box_xyxy.tolist()
-
-                            self.last_valid_bbox = self.current_bbox  # Новий валідний bbox
-                            self.lost_frames = 0  # Reset counter
-                            self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
-                            self.search_candidates = []  # Очистити кандидатів (Phase 3 - знайдено)
-
-                            # ⭐ Заповнити top_candidates для візуалізації на першому фреймі після відновлення
-                            self.top_candidates = []
-                            for idx, box in enumerate(boxes):
-                                box_xyxy_tmp = box.xyxy[0].cpu().numpy()
-                                curr_box_conf = float(box.conf[0].cpu().numpy())
-                                diou_val = self._compute_diou(self.last_valid_bbox, box_xyxy_tmp)
-                                x1, y1, x2, y2 = box_xyxy_tmp
-                                is_best = (idx == reinit_candidate_idx)
-
-                                # Визначити статус кандидата
-                                status = 'rejected'
-                                if curr_box_conf >= self.reinit_conf_threshold:
-                                    status = 'accepted'
-                                elif diou_val >= current_threshold:
-                                    status = 'accepted'
-
-                                self.top_candidates.append({
-                                    'bbox': [x1, y1, x2 - x1, y2 - y1],
-                                    'iou': diou_val,
-                                    'diou': diou_val,
-                                    'conf': curr_box_conf,
-                                    'is_best_match': is_best,
-                                    'size_valid': True,
-                                    'type': 'phase3',
-                                    'phase': 3,
-                                    'status': status
-                                })
-
-                            # ⭐ Входимо у Phase 3 Validation режим
-                            self.in_phase3_validation = True
-                            self.phase3_validation_consecutive_successes = 0
-                            self.phase3_validation_bbox = self.current_bbox.copy()
-
-                            if self.verbose:
-                                kalman_suffix = " + Kalman" if self.use_kalman else ""
-                                print(f"🔄 Кадр {self.frame_count}: [PHASE 3] Re-ID{kalman_suffix} (conf={box_conf:.3f}, DIoU={reinit_candidate_diou:.3f} >= {current_threshold:.3f})")
-                                print(f"   📊 Validation gate активована (потрібно {self.phase3_redetection_validation_frames} послідовних успішних фреймів)")
-
-                            # Зібрати VPE для нового bbox (якщо conf достатня)
-                            # Під час warmup використовувати мінімальний поріг
-                            if self.in_warmup:
-                                current_vpe_threshold = self._get_adaptive_conf()
-                            else:
-                                current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
-
-                            if box_conf >= current_vpe_threshold:
+                            if self.phase3_redetection_validation_frames > 0:
+                                # Зберегти кандидата для validation — НЕ оновлювати last_valid_bbox/lost_frames
+                                self.in_phase3_validation = True
+                                self.phase3_validation_consecutive_successes = 0
+                                self.phase3_validation_failure_count = 0
+                                self.phase3_validation_bbox = box_xyxy.tolist()
+                                if self.phase3_vpe_freeze_frames > 0:
+                                    self.phase3_vpe_freeze_counter = self.phase3_vpe_freeze_frames
                                 if self.verbose:
-                                    print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                                self._collect_vpe(image, self.current_bbox, box_conf)
-                                self.vpe_pending = False  # VPE зібрано
+                                    print(f"🔍 Кадр {self.frame_count}: [PHASE 3] DIoU кандидат (conf={box_conf:.3f}, DIoU={reinit_candidate_diou:.3f}), validation на {self.phase3_redetection_validation_frames} кадрів")
+                                return False, None
                             else:
-                                self.vpe_pending = True  # Встановити флаг для наступних кадрів
+                                # Validation вимкнена — миттєвий commit
+                                detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
+                                if self.use_kalman and self.kalman is not None:
+                                    smoothed_bbox = self.kalman.update(detected_bbox_xywh)
+                                    x, y, w, h = smoothed_bbox
+                                    self.current_bbox = [x, y, x + w, y + h]
+                                else:
+                                    self.current_bbox = box_xyxy.tolist()
+                                self.last_valid_bbox = self.current_bbox
+                                self.lost_frames = 0
+                                self.last_bbox_is_kalman_only = False
+                                self.search_candidates = []
                                 if self.verbose:
-                                    print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
-
-                            x1, y1, x2, y2 = self.current_bbox
-                            return True, [x1, y1, x2 - x1, y2 - y1]
+                                    print(f"🔄 Кадр {self.frame_count}: [PHASE 3] Re-ID (conf={box_conf:.3f}, DIoU={reinit_candidate_diou:.3f})")
+                                x1, y1, x2, y2 = self.current_bbox
+                                return True, [x1, y1, x2 - x1, y2 - y1]
                         else:
                             # Всі detections з низьким DIoU
                             if self.verbose:
@@ -1805,42 +1870,33 @@ class YOLOeVPIoUTracker(BaseTracker):
                             box_xyxy = best_box.xyxy[0].cpu().numpy()
                             box_conf = float(best_box.conf[0].cpu().numpy())
 
-                            # Оновити bbox (з Калманом якщо увімкнено)
-                            detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
-                            if self.use_kalman and self.kalman is not None:
-                                smoothed_bbox = self.kalman.update(detected_bbox_xywh)
-                                x, y, w, h = smoothed_bbox
-                                self.current_bbox = [x, y, x + w, y + h]
-                            else:
-                                self.current_bbox = box_xyxy.tolist()
-
-                            self.last_valid_bbox = self.current_bbox  # Новий валідний bbox
-                            self.lost_frames = 0  # Reset counter
-                            self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
-
-                            if self.verbose:
-                                kalman_suffix = " + Kalman" if self.use_kalman else ""
-                                print(f"🔄 Кадр {self.frame_count}: [PHASE 3] Re-ID{kalman_suffix} (max_conf={box_conf:.3f})")
-
-                            # Зібрати VPE для нового bbox (якщо conf достатня)
-                            # Під час warmup використовувати мінімальний поріг
-                            if self.in_warmup:
-                                current_vpe_threshold = self._get_adaptive_conf()
-                            else:
-                                current_vpe_threshold = self._get_adaptive_vpe_conf_threshold()
-
-                            if box_conf >= current_vpe_threshold:
+                            if self.phase3_redetection_validation_frames > 0:
+                                # Зберегти кандидата для validation — НЕ оновлювати last_valid_bbox/lost_frames
+                                self.in_phase3_validation = True
+                                self.phase3_validation_consecutive_successes = 0
+                                self.phase3_validation_failure_count = 0
+                                self.phase3_validation_bbox = box_xyxy.tolist()
+                                if self.phase3_vpe_freeze_frames > 0:
+                                    self.phase3_vpe_freeze_counter = self.phase3_vpe_freeze_frames
                                 if self.verbose:
-                                    print(f"   📥 Збір VPE для нового bbox (conf={box_conf:.3f} >= {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe})")
-                                self._collect_vpe(image, self.current_bbox, box_conf)
-                                self.vpe_pending = False  # VPE зібрано
+                                    print(f"🔍 Кадр {self.frame_count}: [PHASE 3] max_conf кандидат (conf={box_conf:.3f}), validation на {self.phase3_redetection_validation_frames} кадрів")
+                                return False, None
                             else:
-                                self.vpe_pending = True  # Встановити флаг для наступних кадрів
+                                # Validation вимкнена — миттєвий commit
+                                detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
+                                if self.use_kalman and self.kalman is not None:
+                                    smoothed_bbox = self.kalman.update(detected_bbox_xywh)
+                                    x, y, w, h = smoothed_bbox
+                                    self.current_bbox = [x, y, x + w, y + h]
+                                else:
+                                    self.current_bbox = box_xyxy.tolist()
+                                self.last_valid_bbox = self.current_bbox
+                                self.lost_frames = 0
+                                self.last_bbox_is_kalman_only = False
                                 if self.verbose:
-                                    print(f"   ⚠️  VPE пропущено (conf={box_conf:.3f} < {current_vpe_threshold:.3f}, VPE={self._get_vpe_count()}/{self.max_vpe}), спроба на наступному кадрі")
-
-                            x1, y1, x2, y2 = self.current_bbox
-                            return True, [x1, y1, x2 - x1, y2 - y1]
+                                    print(f"🔄 Кадр {self.frame_count}: [PHASE 3] Re-ID (max_conf={box_conf:.3f})")
+                                x1, y1, x2, y2 = self.current_bbox
+                                return True, [x1, y1, x2 - x1, y2 - y1]
                         else:
                             # Немає detections взагалі
                             if self.verbose:
@@ -2148,6 +2204,13 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.phase1_high_conf_reid_validation_count = 0
         self.phase2_pending_candidate = None
         self.phase2_pending_validation_count = 0
+        self.phase3_vpe_freeze_counter = 0
+        self.phase3_validation_failure_count = 0
+        self.in_phase3_validation = False
+        self.phase3_validation_consecutive_successes = 0
+        self.phase3_validation_bbox = None
+        self.phase3_reference_bbox = None
+        self.phase3_kalman_exit_bbox = None
 
     def get_tracking_info(self) -> Dict[str, Any]:
         """
@@ -2162,11 +2225,10 @@ class YOLOeVPIoUTracker(BaseTracker):
             'warmup_vpe_collected': self._get_vpe_count() if self.in_warmup else self.warmup_vpe_collected,
         }
 
-        # У Фазі 2 (пошук/очікування) передаємо last_valid_bbox для візуалізації
-        if self.lost_frames > 0 and self.lost_frames < self.max_lost_frames:
-            if self.last_valid_bbox:
-                x1, y1, x2, y2 = self.last_valid_bbox
-                info['last_valid_bbox'] = [x1, y1, x2 - x1, y2 - y1]  # [x, y, w, h]
+        # last_valid_bbox — передаємо завжди коли об'єкт втрачено (Phase 2 і Phase 3)
+        if self.lost_frames > 0 and self.last_valid_bbox:
+            x1, y1, x2, y2 = self.last_valid_bbox
+            info['last_valid_bbox'] = [x1, y1, x2 - x1, y2 - y1]  # [x, y, w, h]
 
         # Top candidates з IoU scores у Phase 1 для візуалізації
         if self.lost_frames == 0 and len(self.top_candidates) > 0:
@@ -2182,6 +2244,12 @@ class YOLOeVPIoUTracker(BaseTracker):
 
         # Флаг: чи є поточний bbox тільки від Калмана (не валідовано детекціями)
         info['last_bbox_is_kalman_only'] = self.last_bbox_is_kalman_only
+
+        # Reference bbox для Phase 3 порівнянь (залежно від phase3_ref_mode)
+        if self.phase3_reference_bbox is not None:
+            x1, y1, x2, y2 = self.phase3_reference_bbox
+            info['phase3_reference_bbox'] = [x1, y1, x2 - x1, y2 - y1]  # [x, y, w, h]
+            info['phase3_ref_mode'] = self.phase3_ref_mode
 
         return info
 
