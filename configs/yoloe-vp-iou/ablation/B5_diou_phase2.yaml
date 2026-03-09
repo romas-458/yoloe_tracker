@@ -1,0 +1,50 @@
+# B5: +DIoU Phase2 - додати DIoU метрику (тільки Phase 2)
+name: "B5 +DIoU Phase2"
+description: "B-series: VPE + Kalman + Phase 2 DIoU only (no Phase 3, no Adaptive, no DualMemory)"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "B5"
+version: "1.0"
+
+model_path: "yoloe-v8s-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# Детекція (фіксована)
+conf: 0.01
+conf_max: 0.01
+conf_adaptive_rate: 999999
+iou_threshold: 0.3
+
+# ✅ VPE
+vpe_step: 10
+max_vpe: 50
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.05
+vpe_conf_adaptive_rate: 999999
+
+max_lost_frames: 15
+warmup_frames: 0
+
+# ✅ Phase 2 DIoU УВІМКНЕНО
+phase2_diou_threshold: -0.1
+phase2_switch_validation_frames: 1
+waiting_reinit_conf_threshold: 1.00
+waiting_reinit_diou_threshold: -0.5
+
+# ❌ Phase 3 DIoU ВИМКНЕНО (тестуємо тільки Phase 2)
+reinit_conf_threshold: 1.0
+reinit_diou_threshold: -1.0
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 15
+phase3_redetection_validation_frames: 0
+
+# ✅ KALMAN
+use_kalman: true
+kalman_process_noise: 0.001
+kalman_measurement_noise: 0.0001
+
+# ❌ DUAL MEMORY ВИМКНЕНО
+use_dual_memory_vpe: false
+
+verbose: false
+debug_frame_step: 100

@@ -1,0 +1,50 @@
+# B7: +Adaptive - додати адаптивний confidence
+name: "B7 +Adaptive"
+description: "B-series: VPE + Kalman + Phase 2+3 DIoU + Adaptive confidence (no DualMemory)"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "B7"
+version: "1.0"
+
+model_path: "yoloe-v8s-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# ✅ ADAPTIVE CONFIDENCE
+conf: 0.05
+conf_max: 0.1
+conf_adaptive_rate: 30
+iou_threshold: 0.2
+
+# ✅ VPE з adaptive
+vpe_step: 10
+max_vpe: 50
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.2
+adaptive_rate: 500
+
+max_lost_frames: 15
+warmup_frames: 0
+
+# ✅ Phase 2 DIoU
+phase2_diou_threshold: -0.1
+phase2_switch_validation_frames: 1
+waiting_reinit_conf_threshold: 1.00
+waiting_reinit_diou_threshold: -0.5
+
+# ✅ Phase 3 DIoU
+reinit_conf_threshold: 0.3
+reinit_diou_threshold: -0.6
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 25
+phase3_redetection_validation_frames: 1
+
+# ✅ KALMAN
+use_kalman: true
+kalman_process_noise: 0.001
+kalman_measurement_noise: 0.0001
+
+# ❌ DUAL MEMORY ВИМКНЕНО
+use_dual_memory_vpe: false
+
+verbose: false
+debug_frame_step: 10000
