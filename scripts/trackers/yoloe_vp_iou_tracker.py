@@ -520,6 +520,13 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.aggregated_vpe = None
         self.initialized = False
 
+        # Кешування set_classes: переустановлюємо класи лише коли агрегований VPE
+        # реально оновився (_vpe_version змінюється в _aggregate_vpe)
+        self._vpe_version = 0
+        self._applied_vpe_version = None
+        # Виділений предиктор для видобування VPE (fix: 1 forward замість 2)
+        self._vpe_predictor = None
+
         # Трифазна логіка tracking
         self.last_valid_bbox = None  # Останній валідний bbox (для IoU порівняння)
         self.lost_frames = 0  # Лічильник кадрів без успішного matching
@@ -861,9 +868,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                         print(f"   ⚠️  Invalid aggregated VPE shape: {self.aggregated_vpe.shape}, очікується [1, 1, D], falling back to visual prompts")
 
             if use_vpe:
-                # Використати агрегований VPE
-                self.model.is_fused = lambda: False
-                self.model.set_classes([0], self.aggregated_vpe)  # Use int instead of string
+                # Використати агрегований VPE; set_classes — лише коли агрегат
+                # оновився після _aggregate_vpe (а не на кожному кадрі)
+                if self._applied_vpe_version != self._vpe_version:
+                    self.model.is_fused = lambda: False
+                    self.model.set_classes([0], self.aggregated_vpe)  # Use int instead of string
+                    self._applied_vpe_version = self._vpe_version
 
                 current_conf = self._get_adaptive_conf()
                 results = self.model.predict(
@@ -890,6 +900,9 @@ class YOLOeVPIoUTracker(BaseTracker):
                     device=self.device,
                     verbose=False,
                 )
+                # VP-предикт переналаштовує nc/names моделі — наступного разу
+                # за use_vpe класи треба встановити наново
+                self._applied_vpe_version = None
 
             if len(results) == 0 or len(results[0].boxes) == 0:
                 # Немає detections
@@ -962,8 +975,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                 size_ratio_w = box_w / (last_valid_w + 1e-6)
                 size_ratio_h = box_h / (last_valid_h + 1e-6)
 
-                # Допускаємо зміну розміру в діапазоні 0.5-2.0 (50%-200%)
-                size_valid = (0.5 <= size_ratio_w <= 2.0) and (0.5 <= size_ratio_h <= 2.0)
+                # Допускаємо зміну розміру в діапазоні 0.3-2.5 (30%-250%)
                 size_valid = (0.3 <= size_ratio_w <= 2.5) and (0.3 <= size_ratio_h <= 2.5)
 
                 # Зберегти інформацію про кандидата
@@ -1908,6 +1920,30 @@ class YOLOeVPIoUTracker(BaseTracker):
                 print(f"❌ Помилка update: {e}")
             return False, None
 
+    def _get_vpe_predictor(self):
+        """
+        Лінива ініціалізація виділеного VP-предиктора для видобування VPE.
+
+        Ділить той самий nn.Module з основною моделлю (окремих ваг не вантажиться)
+        і не чіпає self.model.predictor, тож детекційний предиктор не
+        перестворюється на кожному кадрі збору VPE.
+        """
+        if self._vpe_predictor is None:
+            self._vpe_predictor = YOLOEVPSegPredictor(
+                overrides=dict(
+                    task="segment", mode="predict", model=self.model_path,
+                    imgsz=self.imgsz, conf=0.001, save=False, batch=1,
+                    verbose=False, device=self.device,
+                    # rect=True — як у предиктора, що створювався через YOLOE.predict
+                    # (успадковував rect із overrides обгортки); без нього letterbox
+                    # квадратний і VPE чисельно інший
+                    rect=True,
+                ),
+                _callbacks=None,
+            )
+            self._vpe_predictor.setup_model(self.model.model, verbose=False)
+        return self._vpe_predictor
+
     def _collect_vpe(self, image: np.ndarray, bbox: list, conf: float = 0.5):
         """
         Зібрати VPE з поточного кадру
@@ -1924,21 +1960,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                 cls=np.array([0]),
             )
 
-            # Run prediction для створення predictor
-            current_conf = self._get_adaptive_conf()
-            results = self.model.predict(
-                image,
-                visual_prompts=visual_prompts,
-                predictor=YOLOEVPSegPredictor,
-                conf=current_conf,
-                imgsz=self.imgsz,
-                device=self.device,
-                verbose=False,
-            )
-
-            # Встановити промти та отримати VPE
-            self.model.predictor.set_prompts(visual_prompts)
-            vpe = self.model.predictor.get_vpe(image)
+            # Виділений VPE-предиктор: ОДИН forward (get_vpe) замість двох
+            # (раніше повний model.predict запускався лише щоб створити predictor,
+            #  а його результат не використовувався)
+            vp = self._get_vpe_predictor()
+            vp.set_prompts(visual_prompts)
+            vpe = vp.get_vpe(image)
 
             # Validate VPE
             if vpe is None:
@@ -1989,6 +2016,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             if self.use_dual_memory_vpe:
                 # Use dual memory aggregation
                 self.aggregated_vpe = self.dual_memory.get_aggregated_vpe()
+                self._vpe_version += 1
 
                 if self.verbose and self.aggregated_vpe is not None:
                     stats = self.dual_memory.get_stats()
@@ -2004,6 +2032,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                 # Нормалізувати
                 self.aggregated_vpe = F.normalize(self.aggregated_vpe, p=2, dim=-1)
+                self._vpe_version += 1
 
                 if self.verbose:
                     print(f"   🔄 Агреговано {self._get_vpe_count()} VPE, shape={self.aggregated_vpe.shape}")
