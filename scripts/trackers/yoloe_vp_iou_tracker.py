@@ -371,6 +371,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                  phase3_redetection_validation_frames: int = 3,
                  phase3_appearance_weight: float = 0.0,
                  phase3_appearance_ref: str = 'aggregated',
+                 vpe_gate_threshold: float = 0.0,
+                 vpe_gate_ref: str = 'aggregated',
                  use_kalman: bool = False,
                  kalman_process_noise: float = 0.01,
                  kalman_measurement_noise: float = 10.0,
@@ -434,6 +436,13 @@ class YOLOeVPIoUTracker(BaseTracker):
         # w=0 -> вимкнено (max(conf), поведінка без змін); ref: 'aggregated' | 'anchor'
         self.phase3_appearance_weight = phase3_appearance_weight
         self.phase3_appearance_ref = phase3_appearance_ref
+        # Гейт пам'яті: новий VPE додається лише якщо sim із референсом пам'яті
+        # >= порога (шкала [0,1], (cos+1)/2); 0.0 = вимкнено. ref: 'aggregated'
+        # (еволюціонує з виглядом; надійніше за 'anchor' при значних змінах)
+        self.vpe_gate_threshold = vpe_gate_threshold
+        self.vpe_gate_ref = vpe_gate_ref
+        self.vpe_gate_accepted = 0   # діагностика
+        self.vpe_gate_rejected = 0
         self.phase3_vpe_freeze_frames = kwargs.get('phase3_vpe_freeze_frames', 0)
         # Режим вибору reference bbox для Phase 3 порівнянь:
         #   'last_valid'    — остання детектована позиція (default, стабільно)
@@ -655,6 +664,8 @@ class YOLOeVPIoUTracker(BaseTracker):
             'phase3_redetection_validation_frames': 3,
             'phase3_appearance_weight': 0.0,
             'phase3_appearance_ref': 'aggregated',
+            'vpe_gate_threshold': 0.0,
+            'vpe_gate_ref': 'aggregated',
             'use_kalman': False,
             'kalman_process_noise': 0.01,
             'kalman_measurement_noise': 10.0,
@@ -1973,12 +1984,14 @@ class YOLOeVPIoUTracker(BaseTracker):
         return self._vpe_predictor
 
     # --- Phase 3: appearance-зважений вибір кандидата реініціалізації ---------
-    def _get_appearance_ref_vpe(self):
-        """Референсний VPE для порівняння кандидатів (phase3_appearance_ref):
+    def _get_appearance_ref_vpe(self, mode: Optional[str] = None):
+        """Референсний VPE пам'яті ('anchor' | 'aggregated'):
         'anchor' — VPE першого кадру (лише dual memory); 'aggregated' — поточний
         агрегат пам'яті, що еволюціонує разом із виглядом об'єкта (за суттєвої
-        зміни вигляду, напр. дрон у польоті на LaSOT, надійніший за anchor)."""
-        if self.phase3_appearance_ref == 'anchor' and self.dual_memory is not None:
+        зміни вигляду, напр. дрон у польоті на LaSOT, надійніший за anchor).
+        mode=None -> phase3_appearance_ref (для Phase 3 вибору)."""
+        mode = mode or self.phase3_appearance_ref
+        if mode == 'anchor' and self.dual_memory is not None:
             anchor = self.dual_memory.get_anchor_vpe()
             if anchor is not None:
                 return anchor
@@ -2071,6 +2084,20 @@ class YOLOeVPIoUTracker(BaseTracker):
 
             if self.verbose:
                 print(f"   📊 VPE shape: {vpe.shape}")
+
+            # Гейт пам'яті: відхилити VPE, несхожий на референс пам'яті
+            # (захист від забруднення пам'яті після дрейфу на дистрактор)
+            if self.vpe_gate_threshold > 0.0:
+                gate_ref = self._get_appearance_ref_vpe(self.vpe_gate_ref)
+                if gate_ref is not None:
+                    gate_sim = self._calculate_cosine_similarity(gate_ref, vpe)
+                    if gate_sim < self.vpe_gate_threshold:
+                        self.vpe_gate_rejected += 1
+                        if self.verbose:
+                            print(f"   🚫 VPE відхилено гейтом (sim={gate_sim:.3f} < "
+                                  f"{self.vpe_gate_threshold}, ref={self.vpe_gate_ref})")
+                        return
+                    self.vpe_gate_accepted += 1
 
             # Додати до dual memory або simple deque
             if self.use_dual_memory_vpe:
