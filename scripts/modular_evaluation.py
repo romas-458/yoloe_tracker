@@ -653,8 +653,12 @@ class ModularEvaluator:
             # Фон для таблиці
             table_height = len(table_lines) * line_height + 10
             first_table_height = table_height  # Запам'ятати висоту для другої таблиці
-            cv2.rectangle(image, (5, 5), (400, 5 + table_height), (30, 30, 30), -1)
-            cv2.rectangle(image, (5, 5), (400, 5 + table_height), (200, 200, 200), 1)
+            # Ширина за найширшим рядком (текст малюється від x=10)
+            table_text_w = max(cv2.getTextSize(l, font, font_size, font_thickness)[0][0]
+                               for l in table_lines)
+            table_x2 = 10 + table_text_w + 8
+            cv2.rectangle(image, (5, 5), (table_x2, 5 + table_height), (30, 30, 30), -1)
+            cv2.rectangle(image, (5, 5), (table_x2, 5 + table_height), (200, 200, 200), 1)
 
             # Малювати рядки таблиці
             for line_idx, line in enumerate(table_lines):
@@ -750,8 +754,12 @@ class ModularEvaluator:
                 table_y1 = 5 + first_table_height + zazor
                 table_y2 = table_y1 + table_height
 
-                cv2.rectangle(image, (5, table_y1), (420, table_y2), (30, 30, 30), -1)
-                cv2.rectangle(image, (5, table_y1), (420, table_y2), (200, 200, 200), 1)
+                # Ширина за найширшим рядком (текст малюється від x=10)
+                table_text_w = max(cv2.getTextSize(l, font, font_size, font_thickness)[0][0]
+                                   for l in table_lines)
+                table_x2 = 10 + table_text_w + 8
+                cv2.rectangle(image, (5, table_y1), (table_x2, table_y2), (30, 30, 30), -1)
+                cv2.rectangle(image, (5, table_y1), (table_x2, table_y2), (200, 200, 200), 1)
 
                 # Малювати рядки таблиці
                 for line_idx, line in enumerate(table_lines):
