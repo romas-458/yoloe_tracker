@@ -369,6 +369,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                  reinit_adaptive_rate: int = 15,
                  reinit_conf_threshold: float = 1.0,
                  phase3_redetection_validation_frames: int = 3,
+                 phase3_appearance_weight: float = 0.0,
+                 phase3_appearance_ref: str = 'aggregated',
                  use_kalman: bool = False,
                  kalman_process_noise: float = 0.01,
                  kalman_measurement_noise: float = 10.0,
@@ -428,6 +430,10 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.reinit_adaptive_rate = reinit_adaptive_rate
         self.reinit_conf_threshold = reinit_conf_threshold
         self.phase3_redetection_validation_frames = phase3_redetection_validation_frames
+        # Phase 3 appearance-вибір кандидата: score = (1-w)*conf + w*sim(VPE)
+        # w=0 -> вимкнено (max(conf), поведінка без змін); ref: 'aggregated' | 'anchor'
+        self.phase3_appearance_weight = phase3_appearance_weight
+        self.phase3_appearance_ref = phase3_appearance_ref
         self.phase3_vpe_freeze_frames = kwargs.get('phase3_vpe_freeze_frames', 0)
         # Режим вибору reference bbox для Phase 3 порівнянь:
         #   'last_valid'    — остання детектована позиція (default, стабільно)
@@ -647,6 +653,8 @@ class YOLOeVPIoUTracker(BaseTracker):
             'reinit_adaptive_rate': 15,
             'reinit_conf_threshold': 1.0,
             'phase3_redetection_validation_frames': 3,
+            'phase3_appearance_weight': 0.0,
+            'phase3_appearance_ref': 'aggregated',
             'use_kalman': False,
             'kalman_process_noise': 0.01,
             'kalman_measurement_noise': 10.0,
@@ -1731,18 +1739,23 @@ class YOLOeVPIoUTracker(BaseTracker):
                     high_conf_candidate_conf = 0
 
                     if self.reinit_conf_threshold < 1.0:
+                        high_conf_eligible = []
                         for idx, box in enumerate(boxes):
                             box_conf = float(box.conf[0].cpu().numpy())
                             if box_conf >= self.reinit_conf_threshold:
+                                box_xyxy_temp = box.xyxy[0].cpu().numpy()
                                 # ⭐ Також перевіряємо DIoU якщо reinit_diou_threshold заданий
                                 if self.reinit_diou_threshold > -1.0 and phase3_ref_bbox:
-                                    box_xyxy_temp = box.xyxy[0].cpu().numpy()
                                     diou_temp = self._compute_diou(phase3_ref_bbox, box_xyxy_temp)
                                     if diou_temp < self.reinit_diou_threshold:
                                         continue  # DIoU занадто малий — пропустити
-                                if box_conf > high_conf_candidate_conf:
-                                    high_conf_candidate_conf = box_conf
-                                    high_conf_candidate_idx = idx
+                                high_conf_eligible.append({'idx': idx, 'conf': box_conf,
+                                                           'xyxy': box_xyxy_temp})
+                        if high_conf_eligible:
+                            chosen = self._select_phase3_candidate(image, high_conf_eligible,
+                                                                   tag="high-conf")
+                            high_conf_candidate_idx = chosen['idx']
+                            high_conf_candidate_conf = chosen['conf']
 
                     # Якщо знайдено високоякісну детекцію, використати її
                     if high_conf_candidate_idx >= 0:
@@ -1790,6 +1803,7 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                         # Фільтрація за DIoU від phase3_ref_bbox (Kalman або last_valid_bbox)
                         all_candidates = []  # Всі кандидати для verbose виводу
+                        reinit_eligible = []  # Кандидати, що пройшли DIoU-гейт
 
                         for idx, box in enumerate(boxes):
                             box_xyxy = box.xyxy[0].cpu().numpy()
@@ -1809,10 +1823,8 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                             # Перевірити чи в межах threshold
                             if diou >= current_threshold:
-                                if box_conf > reinit_candidate_conf:
-                                    reinit_candidate_conf = box_conf
-                                    reinit_candidate_idx = idx
-                                    reinit_candidate_diou = diou
+                                reinit_eligible.append({'idx': idx, 'conf': box_conf,
+                                                        'xyxy': box_xyxy, 'diou': diou})
                             else:
                                 # Зберегти відкинутого кандидата для візуалізації
                                 x1, y1, x2, y2 = box_xyxy
@@ -1835,6 +1847,12 @@ class YOLOeVPIoUTracker(BaseTracker):
                             for i, cand in enumerate(all_candidates):
                                 status = "✅ ПРИЙНЯТО" if cand['accepted'] else "❌ ВІДКИНУТО"
                                 print(f"      #{i+1}: {status} | conf={cand['conf']:.3f}, DIoU={cand['diou']:.3f}")
+
+                        if reinit_eligible:
+                            chosen = self._select_phase3_candidate(image, reinit_eligible, tag="DIoU")
+                            reinit_candidate_idx = chosen['idx']
+                            reinit_candidate_conf = chosen['conf']
+                            reinit_candidate_diou = chosen['diou']
 
                         if reinit_candidate_idx >= 0:
                             best_box = boxes[reinit_candidate_idx]
@@ -1876,7 +1894,17 @@ class YOLOeVPIoUTracker(BaseTracker):
                             return False, None
 
                     else:
-                        # Немає обмеження на DIoU - використати max(conf) як раніше
+                        # Немає обмеження на DIoU — max(conf) або appearance-зважений вибір
+                        if best_conf_idx >= 0 and self.phase3_appearance_weight > 0.0:
+                            fallback_eligible = [
+                                {'idx': idx,
+                                 'conf': float(box.conf[0].cpu().numpy()),
+                                 'xyxy': box.xyxy[0].cpu().numpy()}
+                                for idx, box in enumerate(boxes)
+                            ]
+                            chosen = self._select_phase3_candidate(image, fallback_eligible,
+                                                                   tag="max-conf")
+                            best_conf_idx = chosen['idx']
                         if best_conf_idx >= 0:
                             best_box = boxes[best_conf_idx]
                             box_xyxy = best_box.xyxy[0].cpu().numpy()
@@ -1943,6 +1971,74 @@ class YOLOeVPIoUTracker(BaseTracker):
             )
             self._vpe_predictor.setup_model(self.model.model, verbose=False)
         return self._vpe_predictor
+
+    # --- Phase 3: appearance-зважений вибір кандидата реініціалізації ---------
+    def _get_appearance_ref_vpe(self):
+        """Референсний VPE для порівняння кандидатів (phase3_appearance_ref):
+        'anchor' — VPE першого кадру (лише dual memory); 'aggregated' — поточний
+        агрегат пам'яті, що еволюціонує разом із виглядом об'єкта (за суттєвої
+        зміни вигляду, напр. дрон у польоті на LaSOT, надійніший за anchor)."""
+        if self.phase3_appearance_ref == 'anchor' and self.dual_memory is not None:
+            anchor = self.dual_memory.get_anchor_vpe()
+            if anchor is not None:
+                return anchor
+        return self.aggregated_vpe
+
+    def _encode_boxes_vpe_batch(self, image: np.ndarray, xyxy_list):
+        """L2-нормовані VPE для списку рамок xyxy за ОДИН forward
+        (унікальний cls на рамку -> SAVPE дає окремий ембеддинг на кожну).
+        Повертає тензор (N, D) або None."""
+        if xyxy_list is None or len(xyxy_list) == 0:
+            return None
+        H, W = image.shape[:2]
+        clipped = []
+        for b in xyxy_list:
+            x1, y1, x2, y2 = [float(v) for v in b]
+            x1, y1 = max(0.0, x1), max(0.0, y1)
+            x2, y2 = min(float(W), x2), min(float(H), y2)
+            clipped.append([x1, y1, max(x1 + 1.0, x2), max(y1 + 1.0, y2)])
+        try:
+            vp = self._get_vpe_predictor()
+            vp.set_prompts(dict(bboxes=np.array(clipped, dtype=np.float32),
+                                cls=np.arange(len(clipped), dtype=np.int64)))
+            with torch.no_grad():
+                vpe = vp.get_vpe(image)  # (1, N, D)
+            feats = vpe.reshape(len(clipped), -1).float()
+            return F.normalize(feats, dim=1)
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  Phase 3 batch VPE error: {e}")
+            return None
+
+    def _select_phase3_candidate(self, image: np.ndarray, eligible: List[Dict], tag: str = "") -> Dict:
+        """Вибір кандидата реініціалізації серед eligible=[{idx, conf, xyxy, ...}].
+        За phase3_appearance_weight == 0 — max(conf) (поведінка без змін). Інакше
+        score = (1-w)*conf + w*sim, де sim — косинус VPE кандидата з референсом
+        пам'яті, масштабований у [0, 1]; VPE кандидатів — одним батчованим forward."""
+        w = self.phase3_appearance_weight
+        if w <= 0.0 or len(eligible) == 1:
+            return max(eligible, key=lambda c: c['conf'])
+        ref = self._get_appearance_ref_vpe()
+        if ref is None or not isinstance(ref, torch.Tensor):
+            return max(eligible, key=lambda c: c['conf'])
+        feats = self._encode_boxes_vpe_batch(image, [c['xyxy'] for c in eligible])
+        if feats is None:
+            return max(eligible, key=lambda c: c['conf'])
+        ref_v = ref.flatten().float().to(feats.device)
+        ref_v = ref_v / (ref_v.norm() + 1e-8)
+        sims = ((feats @ ref_v + 1.0) / 2.0).tolist()  # [-1..1] -> [0..1]
+        best, best_score = None, -float('inf')
+        for c, s in zip(eligible, sims):
+            c['sim'] = float(s)
+            c['score'] = (1.0 - w) * c['conf'] + w * c['sim']
+            if c['score'] > best_score:
+                best_score, best = c['score'], c
+        if self.verbose:
+            print(f"   🎯 [PHASE 3 {tag}] appearance-вибір (w={w}, ref={self.phase3_appearance_ref}):")
+            for c in sorted(eligible, key=lambda x: -x['score']):
+                mark = " ← ОБРАНО" if c is best else ""
+                print(f"      idx={c['idx']}: conf={c['conf']:.3f} sim={c['sim']:.3f} score={c['score']:.3f}{mark}")
+        return best
 
     def _collect_vpe(self, image: np.ndarray, bbox: list, conf: float = 0.5):
         """
