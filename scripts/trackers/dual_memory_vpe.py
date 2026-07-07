@@ -173,6 +173,15 @@ class DualMemoryVPE:
                 if self.verbose:
                     print(f"   🔄 LT VPE замінено (conf: {worst_lt_conf:.3f} → {best_st_conf:.3f})")
 
+    def get_anchor_vpe(self) -> Optional[torch.Tensor]:
+        """
+        Anchor VPE (VPE першого кадру, фіксований).
+
+        Returns:
+            Anchor VPE tensor [1, 1, D] або None якщо ще не встановлено
+        """
+        return self.anchor_vpe
+
     def get_aggregated_vpe(self) -> Optional[torch.Tensor]:
         """
         Агрегація VPE з dual memory
