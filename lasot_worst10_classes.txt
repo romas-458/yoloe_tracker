@@ -1,0 +1,63 @@
+# LaSOT worst-10-classes test list (by mean AUC, B9_full run)
+# 10 найгірших класів × 4 відео = 40 послідовностей для подальших тестів
+# Формат: category-video_number
+
+# yoyo: mean AUC 0.100
+yoyo-15
+yoyo-17
+yoyo-19
+yoyo-7
+
+# volleyball: mean AUC 0.164
+volleyball-1
+volleyball-13
+volleyball-18
+volleyball-19
+
+# kite: mean AUC 0.219
+kite-10
+kite-15
+kite-4
+kite-6
+
+# guitar: mean AUC 0.241
+guitar-10
+guitar-16
+guitar-3
+guitar-8
+
+# swing: mean AUC 0.241
+swing-10
+swing-14
+swing-17
+swing-20
+
+# pool: mean AUC 0.268
+pool-12
+pool-15
+pool-3
+pool-7
+
+# pig: mean AUC 0.305
+pig-10
+pig-13
+pig-18
+pig-2
+
+# hand: mean AUC 0.312
+hand-16
+hand-2
+hand-3
+hand-9
+
+# goldfish: mean AUC 0.312
+goldfish-10
+goldfish-3
+goldfish-7
+goldfish-8
+
+# microphone: mean AUC 0.314
+microphone-14
+microphone-16
+microphone-2
+microphone-6

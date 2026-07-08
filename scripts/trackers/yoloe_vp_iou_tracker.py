@@ -450,6 +450,19 @@ class YOLOeVPIoUTracker(BaseTracker):
         #   'kalman_phase3' — поточна Kalman предикція у Phase 3 (найсвіжіша, але може дрейфувати)
         self.phase3_ref_mode = kwargs.get('phase3_ref_mode', 'last_valid')
 
+        # ⭐ Phase 3 joint DIoU×conf score (за прапорцем use_joint_score):
+        # один неперервний бал у [0,1] замість окремих conf/DIoU reinit-гейтів
+        # + вибору max(conf). Об'єднує близькість і впевненість в одну ручку.
+        #   score = geometric: conf^(1-λ) · diou_norm^λ  (AND-подібний, default)
+        #           arithmetic: (1-λ)·conf + λ·diou_norm (з компенсацією)
+        #   diou_norm = (diou+1)/2;  λ спадає від lam_start до lam_min з часом втрати.
+        self.use_joint_score = kwargs.get('use_joint_score', False)
+        self.joint_mode = kwargs.get('joint_mode', 'geometric')          # 'geometric' | 'arithmetic'
+        self.reinit_joint_threshold = kwargs.get('reinit_joint_threshold', 0.5)
+        self.joint_lam_start = kwargs.get('joint_lam_start', 0.5)         # вага близькості щойно після втрати
+        self.joint_lam_min = kwargs.get('joint_lam_min', 0.2)            # вага близькості після довгої втрати
+        self.reinit_diou_floor = kwargs.get('reinit_diou_floor', -0.95)  # жорсткий anti-teleport floor
+
         # Phase 1 High Confidence Re-ID
         self.phase1_high_conf_reid_threshold = kwargs.get('phase1_high_conf_reid_threshold', 0.9)
         self.phase1_high_conf_reid_iou = kwargs.get('phase1_high_conf_reid_iou', 0.3)
@@ -1745,6 +1758,43 @@ class YOLOeVPIoUTracker(BaseTracker):
                             'status': status
                         })
 
+                    # ⭐ Joint DIoU×conf score (за прапорцем use_joint_score):
+                    # єдиний неперервний бал замість окремих conf/DIoU reinit-гейтів
+                    # + вибору max(conf). Коротко замикає легасі-шляхи нижче.
+                    if self.use_joint_score and phase3_ref_bbox:
+                        lam = self._adaptive_lambda()
+                        joint_eligible = []
+                        for idx, box in enumerate(boxes):
+                            box_xyxy = box.xyxy[0].cpu().numpy()
+                            box_conf = float(box.conf[0].cpu().numpy())
+                            diou = self._compute_diou(phase3_ref_bbox, box_xyxy)
+                            if diou < self.reinit_diou_floor:   # anti-teleport sanity floor
+                                x1, y1, x2, y2 = box_xyxy
+                                self.rejected_candidates.append({
+                                    'bbox': [x1, y1, x2 - x1, y2 - y1],
+                                    'conf': box_conf, 'diou': diou})
+                                continue
+                            joint_eligible.append({
+                                'idx': idx, 'conf': box_conf, 'xyxy': box_xyxy,
+                                'diou': diou,
+                                'score': self._joint_score(box_conf, diou, lam)})
+
+                        if self.verbose and joint_eligible:
+                            print(f"   🔍 Фаза 3 [joint λ={lam:.2f}, {self.joint_mode}, thr={self.reinit_joint_threshold}]: {len(joint_eligible)} кандидатів:")
+                            for c in sorted(joint_eligible, key=lambda x: -x['score']):
+                                print(f"      score={c['score']:.3f} | conf={c['conf']:.3f}, DIoU={c['diou']:.3f}")
+
+                        if joint_eligible:
+                            best = max(joint_eligible, key=lambda c: c['score'])
+                            if best['score'] >= self.reinit_joint_threshold:
+                                return self._commit_phase3_reid(
+                                    best['xyxy'], best['conf'],
+                                    tag=f"Joint(score={best['score']:.3f},DIoU={best['diou']:.3f})")
+                        if self.verbose:
+                            best_s = max((c['score'] for c in joint_eligible), default=float('nan'))
+                            print(f"❌ Кадр {self.frame_count}: [PHASE 3] Joint Re-ID failed (best score {best_s:.3f} < {self.reinit_joint_threshold})")
+                        return False, None
+
                     # Спочатку перевіряємо чи є детекція з високою conf (автоматична реініціалізація)
                     high_conf_candidate_idx = -1
                     high_conf_candidate_conf = 0
@@ -2163,6 +2213,68 @@ class YOLOeVPIoUTracker(BaseTracker):
         except Exception as e:
             if self.verbose:
                 print(f"   ⚠️  Помилка агрегації: {e}")
+
+    def _adaptive_lambda(self) -> float:
+        """
+        Вага просторової близькості (λ) для Phase 3 joint-score.
+
+        Спадає від joint_lam_start (щойно загубився — довіряй позиції) до
+        joint_lam_min (давно загублений — об'єкт міг переміститись, довіряй
+        впевненості) за reinit_adaptive_rate кадрів у Фазі 3.
+        """
+        if self.lost_frames < self.max_lost_frames:
+            return self.joint_lam_start
+        frames_in_phase3 = self.lost_frames - self.max_lost_frames
+        progress = min(1.0, frames_in_phase3 / max(1, self.reinit_adaptive_rate))
+        return self.joint_lam_start * (1.0 - progress) + self.joint_lam_min * progress
+
+    def _joint_score(self, conf: float, diou: float, lam: float) -> float:
+        """
+        Об'єднати впевненість і DIoU-близькість в один бал у [0,1].
+
+        diou відображається [-1,1] -> [0,1] як (diou+1)/2 (та сама шкала, що й
+        у _calculate_cosine_similarity). joint_mode:
+          'geometric'  — conf^(1-λ)·diou_norm^λ (AND-подібний: обидва мають бути пристойні)
+          'arithmetic' — (1-λ)·conf + λ·diou_norm (компенсація: висока conf рятує середній DIoU)
+        """
+        diou_norm = (diou + 1.0) / 2.0
+        if self.joint_mode == 'arithmetic':
+            return (1.0 - lam) * conf + lam * diou_norm
+        return (max(conf, 1e-6) ** (1.0 - lam)) * (max(diou_norm, 1e-6) ** lam)
+
+    def _commit_phase3_reid(self, box_xyxy, box_conf: float, tag: str = ""):
+        """
+        Застосувати (або поставити на validation) вибраний Phase 3 re-ID кандидат.
+
+        Спільна commit-логіка (validation vs миттєвий commit + Kalman-згладжування),
+        винесена щоб joint-score гілка не дублювала існуючі шляхи.
+        """
+        box_xyxy = [float(v) for v in box_xyxy]
+        if self.phase3_redetection_validation_frames > 0:
+            self.in_phase3_validation = True
+            self.phase3_validation_consecutive_successes = 0
+            self.phase3_validation_failure_count = 0
+            self.phase3_validation_bbox = list(box_xyxy)
+            if self.phase3_vpe_freeze_frames > 0:
+                self.phase3_vpe_freeze_counter = self.phase3_vpe_freeze_frames
+            if self.verbose:
+                print(f"🔍 Кадр {self.frame_count}: [PHASE 3] {tag} кандидат (conf={box_conf:.3f}), validation на {self.phase3_redetection_validation_frames} кадрів")
+            return False, None
+        detected_bbox_xywh = [box_xyxy[0], box_xyxy[1], box_xyxy[2] - box_xyxy[0], box_xyxy[3] - box_xyxy[1]]
+        if self.use_kalman and self.kalman is not None:
+            smoothed_bbox = self.kalman.update(detected_bbox_xywh)
+            x, y, w, h = smoothed_bbox
+            self.current_bbox = [x, y, x + w, y + h]
+        else:
+            self.current_bbox = list(box_xyxy)
+        self.last_valid_bbox = self.current_bbox
+        self.lost_frames = 0
+        self.last_bbox_is_kalman_only = False
+        self.search_candidates = []
+        if self.verbose:
+            print(f"🔄 Кадр {self.frame_count}: [PHASE 3] {tag} Re-ID (conf={box_conf:.3f})")
+        x1, y1, x2, y2 = self.current_bbox
+        return True, [x1, y1, x2 - x1, y2 - y1]
 
     def _get_adaptive_diou_threshold(self) -> float:
         """

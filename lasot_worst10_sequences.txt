@@ -1,0 +1,15 @@
+# LaSOT Ablation Study Test List — 10 найгірших послідовностей
+# Відібрано за найнижчим AUC з прогону B9_full (results_ablation_b9)
+#
+# Формат: category-video_number
+
+volleyball-13    # AUC 0.014
+monkey-9         # AUC 0.014
+licenseplate-12  # AUC 0.015
+volleyball-19    # AUC 0.016
+kite-10          # AUC 0.019
+pool-7           # AUC 0.021
+bird-15          # AUC 0.023
+swing-17         # AUC 0.026
+robot-5          # AUC 0.028
+guitar-10        # AUC 0.034
