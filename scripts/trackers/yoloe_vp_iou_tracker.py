@@ -462,6 +462,10 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.joint_lam_start = kwargs.get('joint_lam_start', 0.5)         # вага близькості щойно після втрати
         self.joint_lam_min = kwargs.get('joint_lam_min', 0.2)            # вага близькості після довгої втрати
         self.reinit_diou_floor = kwargs.get('reinit_diou_floor', -0.95)  # жорсткий anti-teleport floor
+        # Phase 2 (doubt/re-association після провалу IoU-матчу, до повної втрати):
+        # зберігаємо просторовий gate diou>=phase2_diou_threshold (анти-дистрактор),
+        # але серед плюсклих кандидатів обираємо за joint-балом, а не чистим max(DIoU).
+        self.joint_apply_phase2 = kwargs.get('joint_apply_phase2', False)
 
         # Phase 1 High Confidence Re-ID
         self.phase1_high_conf_reid_threshold = kwargs.get('phase1_high_conf_reid_threshold', 0.9)
@@ -1377,11 +1381,23 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                     if self.phase2_diou_threshold < 1.0 and self.last_valid_bbox:
                         # DIoU увімкнено для Phase 2 (threshold < 1.0)
+                        # Селекція: чистий max(DIoU) або (joint) max joint-балу серед
+                        # кандидатів, що пройшли просторовий gate — gate незмінний.
+                        use_joint_p2 = self.use_joint_score and self.joint_apply_phase2
+                        lam_p2 = self._adaptive_lambda() if use_joint_p2 else None
+                        best_p2_sel = -float('inf')
                         for idx, box in enumerate(boxes):
                             box_xyxy = box.xyxy[0].cpu().numpy()
                             diou = self._compute_diou(self.last_valid_bbox, box_xyxy)
-
-                            if diou >= self.phase2_diou_threshold and diou > phase2_diou_value:
+                            if diou < self.phase2_diou_threshold:
+                                continue
+                            if use_joint_p2:
+                                box_conf = float(box.conf[0].cpu().numpy())
+                                sel = self._joint_score(box_conf, diou, lam_p2)
+                            else:
+                                sel = diou
+                            if sel > best_p2_sel:
+                                best_p2_sel = sel
                                 phase2_diou_value = diou
                                 phase2_diou_idx = idx
 

@@ -25,12 +25,12 @@ LASOT_ROOT = '/home/peoly/datasets/lasot/test'
 LIST = 'lasot_worst10_sequences.txt'
 _cl = ConfigLoader()
 
+R3 = {'use_joint_score': True, 'joint_mode': 'arithmetic',
+      'reinit_joint_threshold': 0.3, 'joint_lam_start': 0.3, 'joint_lam_min': 0.0}
 CONFIGS = {
     'R1_joint_off':  {},
-    'R2_joint_def':  {'use_joint_score': True},   # geometric/0.5/0.5/0.2 defaults
-    'R3_joint_comb': {'use_joint_score': True, 'joint_mode': 'arithmetic',
-                      'reinit_joint_threshold': 0.3,
-                      'joint_lam_start': 0.3, 'joint_lam_min': 0.0},
+    'R3_joint_p3':   dict(R3),                            # Phase 3 only (= B10)
+    'R5_joint_p32':  dict(R3, joint_apply_phase2=True),   # Phase 3 + Phase 2 selection
 }
 
 
