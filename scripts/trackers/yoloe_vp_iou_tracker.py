@@ -373,6 +373,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                  phase3_appearance_ref: str = 'aggregated',
                  vpe_gate_threshold: float = 0.0,
                  vpe_gate_ref: str = 'aggregated',
+                 multi_vpe_prompt: bool = False,
                  use_kalman: bool = False,
                  kalman_process_noise: float = 0.01,
                  kalman_measurement_noise: float = 10.0,
@@ -441,6 +442,13 @@ class YOLOeVPIoUTracker(BaseTracker):
         # (еволюціонує з виглядом; надійніше за 'anchor' при значних змінах)
         self.vpe_gate_threshold = vpe_gate_threshold
         self.vpe_gate_ref = vpe_gate_ref
+        # Мульти-VPE промпт (аналог мультипромпта з текстового OV-трекера):
+        # замість одного агрегованого VPE детектору подаються КІЛЬКА класів
+        # (anchor / LT-avg / ST-avg із dual memory) -> об'єднання кандидатів за
+        # всіма представленнями -> вища повнота виявлення; вибір робить асоціація.
+        # Потребує use_dual_memory_vpe; інакше тихо падає назад на один агрегат.
+        self.multi_vpe_prompt = multi_vpe_prompt
+        self._multi_vpe_active = False  # чи зараз детектор працює з K>1 класами
         self.vpe_gate_accepted = 0   # діагностика
         self.vpe_gate_rejected = 0
         self.phase3_vpe_freeze_frames = kwargs.get('phase3_vpe_freeze_frames', 0)
@@ -683,6 +691,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             'phase3_appearance_ref': 'aggregated',
             'vpe_gate_threshold': 0.0,
             'vpe_gate_ref': 'aggregated',
+            'multi_vpe_prompt': False,
             'use_kalman': False,
             'kalman_process_noise': 0.01,
             'kalman_measurement_noise': 10.0,
@@ -908,7 +917,16 @@ class YOLOeVPIoUTracker(BaseTracker):
                 # оновився після _aggregate_vpe (а не на кожному кадрі)
                 if self._applied_vpe_version != self._vpe_version:
                     self.model.is_fused = lambda: False
-                    self.model.set_classes([0], self.aggregated_vpe)  # Use int instead of string
+                    multi_emb = self._build_multi_vpe() if self.multi_vpe_prompt else None
+                    if multi_emb is not None and multi_emb.size(1) > 1:
+                        # Мульти-VPE: K класів (anchor/LT/ST) -> об'єднання кандидатів
+                        self.model.set_classes(list(range(multi_emb.size(1))), multi_emb)
+                        self._multi_vpe_active = True
+                        if self.verbose:
+                            print(f"   🧩 Мульти-VPE промпт: K={multi_emb.size(1)} представлень")
+                    else:
+                        self.model.set_classes([0], self.aggregated_vpe)  # Use int instead of string
+                        self._multi_vpe_active = False
                     self._applied_vpe_version = self._vpe_version
 
                 current_conf = self._get_adaptive_conf()
@@ -918,6 +936,9 @@ class YOLOeVPIoUTracker(BaseTracker):
                     imgsz=self.imgsz,
                     device=self.device,
                     verbose=False,
+                    # при K>1 той самий об'єкт детектується кількома класами;
+                    # class-agnostic NMS лишає один бокс (з максимальним conf)
+                    agnostic_nms=self._multi_vpe_active,
                 )
             else:
                 # Fallback: звичайні visual prompts
@@ -2048,6 +2069,33 @@ class YOLOeVPIoUTracker(BaseTracker):
             )
             self._vpe_predictor.setup_model(self.model.model, verbose=False)
         return self._vpe_predictor
+
+    def _build_multi_vpe(self):
+        """
+        Зібрати [1, K, D] з доступних представлень пам'яті (anchor, LT-avg,
+        ST-avg) для мульти-VPE промпта. Майже ідентичні представлення
+        (cos >= 0.999) дедуплікуються, щоб не плодити класи. Повертає тензор
+        або None (нема dual memory / жодного представлення).
+        """
+        if self.dual_memory is None:
+            return None
+        views = []
+        try:
+            for v in (self.dual_memory.get_anchor_vpe(),
+                      self.dual_memory.get_long_term_avg_vpe(),
+                      self.dual_memory.get_short_term_avg_vpe()):
+                if v is None or not isinstance(v, torch.Tensor):
+                    continue
+                vv = F.normalize(v.flatten().float(), p=2, dim=0)
+                if all(float(torch.dot(vv, u)) < 0.999 for u in views):
+                    views.append(vv)
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  multi-VPE build error: {e}")
+            return None
+        if not views:
+            return None
+        return torch.stack(views, dim=0).unsqueeze(0)  # [1, K, D]
 
     # --- Phase 3: appearance-зважений вибір кандидата реініціалізації ---------
     def _get_appearance_ref_vpe(self, mode: Optional[str] = None):
