@@ -182,6 +182,26 @@ class DualMemoryVPE:
         """
         return self.anchor_vpe
 
+    def get_long_term_avg_vpe(self) -> Optional[torch.Tensor]:
+        """Середнє long-term VPE ([1,1,D], L2-нормоване) або None."""
+        if len(self.long_term_vpe) == 0:
+            return None
+        lt = torch.cat(list(self.long_term_vpe), dim=1).mean(dim=1, keepdim=True)
+        return F.normalize(lt, p=2, dim=-1)
+
+    def get_short_term_avg_vpe(self) -> Optional[torch.Tensor]:
+        """Temporal-decay-зважене середнє short-term VPE ([1,1,D]) або None."""
+        if len(self.short_term_vpe) == 0:
+            return None
+        w = torch.tensor([self.temporal_decay ** age for age in self.short_term_age],
+                         dtype=torch.float32)
+        w = (w / w.sum()).unsqueeze(0).unsqueeze(2)
+        st = torch.cat(list(self.short_term_vpe), dim=1)
+        if st.device != w.device:
+            w = w.to(st.device)
+        st = (st * w).sum(dim=1, keepdim=True)
+        return F.normalize(st, p=2, dim=-1)
+
     def get_aggregated_vpe(self) -> Optional[torch.Tensor]:
         """
         Агрегація VPE з dual memory

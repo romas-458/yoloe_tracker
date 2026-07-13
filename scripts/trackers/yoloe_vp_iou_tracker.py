@@ -449,6 +449,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Потребує use_dual_memory_vpe; інакше тихо падає назад на один агрегат.
         self.multi_vpe_prompt = multi_vpe_prompt
         self._multi_vpe_active = False  # чи зараз детектор працює з K>1 класами
+        self._multi_vpe_labels = []     # мапа class-id -> вид пам'яті (anchor/LT/ST)
+        self.multi_vpe_candidates = []  # детекції поточного кадру з їх видом (для візуалізації)
         self.vpe_gate_accepted = 0   # діагностика
         self.vpe_gate_rejected = 0
         self.phase3_vpe_freeze_frames = kwargs.get('phase3_vpe_freeze_frames', 0)
@@ -470,6 +472,16 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.joint_lam_start = kwargs.get('joint_lam_start', 0.5)         # вага близькості щойно після втрати
         self.joint_lam_min = kwargs.get('joint_lam_min', 0.2)            # вага близькості після довгої втрати
         self.reinit_diou_floor = kwargs.get('reinit_diou_floor', -0.95)  # жорсткий anti-teleport floor
+        # ⭐ Адаптивний floor: глобальне значення — це компроміс між двома
+        # протилежними режимами. Вільний floor рятує далеке перезахоплення
+        # (racing-10, rubicCube-6), жорсткий — рятує від дистракторів
+        # (tank-9, basketball-1). Один поріг не може обслужити обидва.
+        # Тож затягуємо floor лише коли в кадрі ≥ distractor_min_candidates
+        # впевнених детекцій, тобто коли є кого сплутати.
+        self.adaptive_diou_floor = kwargs.get('adaptive_diou_floor', False)
+        self.reinit_diou_floor_crowded = kwargs.get('reinit_diou_floor_crowded', -0.7)
+        self.distractor_conf_threshold = kwargs.get('distractor_conf_threshold', 0.5)
+        self.distractor_min_candidates = kwargs.get('distractor_min_candidates', 2)
         # Phase 2 (doubt/re-association після провалу IoU-матчу, до повної втрати):
         # зберігаємо просторовий gate diou>=phase2_diou_threshold (анти-дистрактор),
         # але серед плюсклих кандидатів обираємо за joint-балом, а не чистим max(DIoU).
@@ -487,6 +499,9 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.kalman_process_noise = kalman_process_noise
         self.kalman_measurement_noise = kalman_measurement_noise
         self.use_samurai_kalman = use_samurai_kalman
+        # чи ЗАСТОСОВУВАТИ вибір за Eq.7 (M*), а не лише рахувати гібридний бал.
+        # False відтворює стару (неповну) поведінку, коли best_idx ігнорувався.
+        self.samurai_apply_selection = kwargs.get('samurai_apply_selection', True)
         self.kalman_alpha_kf = kalman_alpha_kf
         self.kalman_tau_kf = kalman_tau_kf
         self.kalman_n_max = kalman_n_max
@@ -818,8 +833,13 @@ class YOLOeVPIoUTracker(BaseTracker):
                           f"affinity={affinity_scores[best_idx]:.3f}, hybrid={hybrid_scores[best_idx]:.3f}, "
                           f"motion_conf={motion_conf:.2f}")
 
+                # ⭐ Застосувати вибір за рівнянням 7 (M* = argmax гібридного балу).
+                # Раніше best_idx рахувався й ВИКИДАВСЯ: Калман оновлювався боксом,
+                # який обрала стара Phase-1 IoU-логіка, тож s_kf ні на що не впливав.
+                measurement = (all_detections[best_idx]['bbox_xywh']
+                               if self.samurai_apply_selection else detected_bbox_xywh)
                 # Phase 1: Stability gate оновлення
-                smoothed_bbox = self.kalman.update(detected_bbox_xywh, is_successful=is_successful)
+                smoothed_bbox = self.kalman.update(measurement, is_successful=is_successful)
 
                 samurai_info = {
                     'iou_scores': iou_scores,
@@ -1000,6 +1020,20 @@ class YOLOeVPIoUTracker(BaseTracker):
                         return True, [x1, y1, x2 - x1, y2 - y1]
 
             boxes = results[0].boxes
+
+            # ⭐ Захопити детекції multi-VPE з видом пам'яті (для --visualize):
+            # у K-класовому режимі cls кожної детекції = який вид (anchor/LT/ST) її зловив.
+            self.multi_vpe_candidates = []
+            if self._multi_vpe_active and self._multi_vpe_labels:
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    cls = int(box.cls[0].cpu().numpy())
+                    label = self._multi_vpe_labels[cls] if cls < len(self._multi_vpe_labels) else str(cls)
+                    self.multi_vpe_candidates.append({
+                        'bbox': [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                        'conf': float(box.conf[0].cpu().numpy()),
+                        'view': label,
+                    })
 
             # Ініціалізувати - розрахуємо proximity після Phase 1
             self.current_frame_detections = []
@@ -1800,12 +1834,24 @@ class YOLOeVPIoUTracker(BaseTracker):
                     # + вибору max(conf). Коротко замикає легасі-шляхи нижче.
                     if self.use_joint_score and phase3_ref_bbox:
                         lam = self._adaptive_lambda()
+                        diou_floor = self._current_diou_floor(boxes)
                         joint_eligible = []
                         for idx, box in enumerate(boxes):
                             box_xyxy = box.xyxy[0].cpu().numpy()
                             box_conf = float(box.conf[0].cpu().numpy())
                             diou = self._compute_diou(phase3_ref_bbox, box_xyxy)
-                            if diou < self.reinit_diou_floor:   # anti-teleport sanity floor
+                            below_floor = diou < diou_floor
+                            if self.verbose:
+                                # машинно-читаний рядок для фігури (DIoU, conf):
+                                # включає і відкинутих floor-ом, яких немає в joint_eligible
+                                x1, y1, x2, y2 = box_xyxy
+                                print(f"JOINTCAND frame={self.frame_count} lam={lam:.4f} "
+                                      f"floor={diou_floor} thr={self.reinit_joint_threshold} "
+                                      f"mode={self.joint_mode} conf={box_conf:.4f} diou={diou:.4f} "
+                                      f"score={self._joint_score(box_conf, diou, lam):.4f} "
+                                      f"x1={x1:.1f} y1={y1:.1f} x2={x2:.1f} y2={y2:.1f} "
+                                      f"status={'below_floor' if below_floor else 'eligible'}")
+                            if below_floor:   # anti-teleport sanity floor
                                 x1, y1, x2, y2 = box_xyxy
                                 self.rejected_candidates.append({
                                     'bbox': [x1, y1, x2 - x1, y2 - y1],
@@ -1817,7 +1863,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                                 'score': self._joint_score(box_conf, diou, lam)})
 
                         if self.verbose and joint_eligible:
-                            print(f"   🔍 Фаза 3 [joint λ={lam:.2f}, {self.joint_mode}, thr={self.reinit_joint_threshold}]: {len(joint_eligible)} кандидатів:")
+                            print(f"   🔍 Фаза 3 [joint λ={lam:.2f}, {self.joint_mode}, thr={self.reinit_joint_threshold}, floor={diou_floor}]: {len(joint_eligible)} кандидатів:")
                             for c in sorted(joint_eligible, key=lambda x: -x['score']):
                                 print(f"      score={c['score']:.3f} | conf={c['conf']:.3f}, DIoU={c['diou']:.3f}")
 
@@ -2079,22 +2125,30 @@ class YOLOeVPIoUTracker(BaseTracker):
         """
         if self.dual_memory is None:
             return None
-        views = []
+        views, labels = [], []
         try:
-            for v in (self.dual_memory.get_anchor_vpe(),
-                      self.dual_memory.get_long_term_avg_vpe(),
-                      self.dual_memory.get_short_term_avg_vpe()):
+            for name, v in (('anchor', self.dual_memory.get_anchor_vpe()),
+                            ('LT', self.dual_memory.get_long_term_avg_vpe()),
+                            ('ST', self.dual_memory.get_short_term_avg_vpe())):
                 if v is None or not isinstance(v, torch.Tensor):
                     continue
                 vv = F.normalize(v.flatten().float(), p=2, dim=0)
                 if all(float(torch.dot(vv, u)) < 0.999 for u in views):
                     views.append(vv)
+                    labels.append(name)
         except Exception as e:
             if self.verbose:
                 print(f"   ⚠️  multi-VPE build error: {e}")
             return None
         if not views:
             return None
+        if self.verbose:
+            # машинно-читаний рядок для візуалізації: розходження видів пам'яті.
+            pairs = ' '.join(f'cos_{labels[i]}_{labels[j]}={float(torch.dot(views[i],views[j])):.4f}'
+                             for i in range(len(views)) for j in range(i + 1, len(views)))
+            print(f"MVPE_VIEWS frame={self.frame_count} K={len(views)} "
+                  f"views={'+'.join(labels)} {pairs}")
+        self._multi_vpe_labels = labels   # class-id i -> labels[i]
         return torch.stack(views, dim=0).unsqueeze(0)  # [1, K, D]
 
     # --- Phase 3: appearance-зважений вибір кандидата реініціалізації ---------
@@ -2291,6 +2345,27 @@ class YOLOeVPIoUTracker(BaseTracker):
         frames_in_phase3 = self.lost_frames - self.max_lost_frames
         progress = min(1.0, frames_in_phase3 / max(1, self.reinit_adaptive_rate))
         return self.joint_lam_start * (1.0 - progress) + self.joint_lam_min * progress
+
+    def _current_diou_floor(self, boxes) -> float:
+        """
+        Anti-teleport floor для Phase 3 joint-гейта.
+
+        Без adaptive_diou_floor — сталий reinit_diou_floor.
+        З ним — жорсткий reinit_diou_floor_crowded, коли в кадрі щонайменше
+        distractor_min_candidates детекцій з conf >= distractor_conf_threshold
+        (сцена з дистракторами: далекий стрибок майже напевно хибний), і
+        вільний reinit_diou_floor, коли впевнений кандидат один (далекий
+        стрибок — це, найпевніше, і є ціль після оклюзії чи різкого руху).
+        """
+        if not self.adaptive_diou_floor:
+            return self.reinit_diou_floor
+        confident = sum(
+            1 for box in boxes
+            if float(box.conf[0].cpu().numpy()) >= self.distractor_conf_threshold
+        )
+        if confident >= self.distractor_min_candidates:
+            return self.reinit_diou_floor_crowded
+        return self.reinit_diou_floor
 
     def _joint_score(self, conf: float, diou: float, lam: float) -> float:
         """
@@ -2569,6 +2644,10 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Всі detections під час Phase 2/3 для візуалізації
         if len(self.search_candidates) > 0:
             info['search_candidates'] = self.search_candidates
+
+        # Кандидати multi-VPE з видом пам'яті (anchor/LT/ST), якщо режим активний
+        if self.multi_vpe_candidates:
+            info['multi_vpe_candidates'] = self.multi_vpe_candidates
 
         # Флаг: чи є поточний bbox тільки від Калмана (не валідовано детекціями)
         info['last_bbox_is_kalman_only'] = self.last_bbox_is_kalman_only

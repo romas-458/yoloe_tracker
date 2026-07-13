@@ -94,6 +94,10 @@ class ModularEvaluator:
         self.results_file = self.output_dir / f"results_{tracker_name}.json"
         self.summary_file = self.output_dir / f"summary_{tracker_name}.json"
 
+        # Буфер success/precision кривих (див. _stash_curves / _save_curves)
+        self._curves: Dict[str, Dict] = {}
+        self.dump_per_frame = False   # вмикається з CLI: --dump-per-frame
+
         # Результати
         self.results: List[VideoResult] = []
         self.processed_videos = set()
@@ -373,6 +377,9 @@ class ModularEvaluator:
                 # GOT-10k: усереднити метрики по всіх repetitions
                 all_metrics = [self._compute_got10k_metrics(results, groundtruth) for results in all_results]
 
+                if self.dump_per_frame:
+                    self._curves.setdefault(video_name, {})['ious'] = all_metrics[0]['_ious']
+
                 metrics = {
                     'ao': np.mean([m['ao'] for m in all_metrics]),
                     'sr_50': np.mean([m['sr_50'] for m in all_metrics]),
@@ -408,6 +415,7 @@ class ModularEvaluator:
                 # LaSOT: одна repetition
                 results = all_results[0]
                 metrics = self._compute_metrics(results, groundtruth)
+                self._stash_curves(video_name, metrics)
 
                 result = VideoResult(
                     tracker_name=self.tracker_name,
@@ -887,6 +895,32 @@ class ModularEvaluator:
                 cv2.putText(image, text, (10, y_offset),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
+        # Кандидати multi-VPE: рамка + мітка виду пам'яті (anchor/LT/ST), що її зловив.
+        # Колір за видом (BGR): anchor синій, LT зелений, ST помаранчевий.
+        if tracking_info and tracking_info.get('multi_vpe_candidates'):
+            view_colors = {'anchor': (208, 111, 42), 'LT': (104, 144, 15), 'ST': (52, 106, 235)}
+            H = image.shape[0]
+            for cand in tracking_info['multi_vpe_candidates']:
+                x, y, w, h = [int(v) for v in cand['bbox']]
+                view = cand['view']
+                color = view_colors.get(view, (200, 200, 200))
+                cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+                label = f"{view} {cand['conf']:.2f}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+                ly = y + h + th + 4 if y - 6 < th else y - 6
+                cv2.rectangle(image, (x, ly - th - 3), (x + tw + 4, ly + 2), color, -1)
+                cv2.putText(image, label, (x + 2, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+            # легенда видів у нижньому лівому куті
+            lx, ly = 10, H - 10
+            cv2.putText(image, "multi-VPE:", (lx, ly - 3 * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            for i, (v, c) in enumerate(view_colors.items()):
+                yy = ly - (2 - i) * 18
+                cv2.rectangle(image, (lx, yy - 10), (lx + 14, yy), c, -1)
+                cv2.putText(image, v, (lx + 20, yy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+
         cv2.imwrite(str(output_path), image)
 
     @staticmethod
@@ -910,6 +944,35 @@ class ModularEvaluator:
         # Права лінія
         for y in range(y1, y2, dash_length * 2):
             cv2.line(image, (x2, y), (x2, min(y + dash_length, y2)), color, thickness)
+
+    def _stash_curves(self, video_name: str, metrics: Dict):
+        """
+        Забрати success/precision криві (і, за прапорцем, per-frame IoU) з metrics
+        у буфер, а самі приватні ключі видалити — щоб не потрапили у VideoResult.
+
+        Криві дешеві: 101+51+51 float на відео. Per-frame IoU важчий, тому лише
+        за self.dump_per_frame. Без цих даних неможливі success plot, precision
+        plot і часовий профіль IoU — раніше вони рахувались і викидались.
+        """
+        buf = self._curves.setdefault(video_name, {})
+        buf['success'] = metrics.pop('_success_curve')
+        buf['precision'] = metrics.pop('_precision_curve')
+        buf['norm_precision'] = metrics.pop('_norm_prec_curve')
+        ious = metrics.pop('_ious')
+        if self.dump_per_frame:
+            buf['ious'] = ious
+
+    def _save_curves(self):
+        """Записати буфер кривих у <output_dir>/curves_<tracker>.npz"""
+        if not self._curves:
+            return
+        flat = {}
+        for video, d in self._curves.items():
+            for key, arr in d.items():
+                flat[f'{video}|{key}'] = arr
+        path = self.output_dir / f'curves_{self.tracker_name}.npz'
+        np.savez_compressed(path, **flat)
+        print(f"📈 Криві збережено: {path} ({len(self._curves)} відео)")
 
     def _compute_metrics(self, pred_bboxes: List, gt_bboxes: List) -> Dict:
         """Обчислити метрики"""
@@ -944,17 +1007,31 @@ class ModularEvaluator:
         distances = np.array(distances)
         norm_distances = np.array(norm_distances)
 
+        # Пороги success/precision plot-ів (конвенція OTB/LaSOT)
+        succ_thr = np.arange(0, 1.01, 0.01)          # 101 точка
+        prec_thr = np.arange(0, 51, 1.0)             # 51 точка, пікселі
+        nprec_thr = np.linspace(0, 0.5, 51)          # 51 точка, нормалізовані
+
+        # Криві. AUC та Pnorm — це просто середні по цих кривих, тож раніше вони
+        # рахувались і викидались. Зберігаємо, бо без них немає success plot.
+        success_curve = np.array([np.mean(ious >= t) for t in succ_thr])
+        precision_curve = np.array([np.mean(distances <= t) for t in prec_thr])
+        norm_prec_curve = np.array([np.mean(norm_distances <= t) for t in nprec_thr])
+
         # Metrics
         metrics = {
-            'auc': float(np.mean([np.mean(ious >= t) for t in np.arange(0, 1.01, 0.01)])),
+            'auc': float(success_curve.mean()),
             'precision_20': float(np.mean(distances <= 20.0)),
-            'normalized_precision': float(np.mean([
-                np.mean(norm_distances <= t) for t in np.linspace(0, 0.5, 51)
-            ])),  # Pnorm - AUC normalized precision curve
+            'normalized_precision': float(norm_prec_curve.mean()),  # Pnorm
             'avg_iou': float(np.mean(ious)),
             'median_iou': float(np.median(ious)),
             'success_0.5': float(np.mean(ious >= 0.5)),
-            'tracking_rate': sum(1 for p in pred_bboxes if p) / len(pred_bboxes)
+            'tracking_rate': sum(1 for p in pred_bboxes if p) / len(pred_bboxes),
+            # приватні поля: не потрапляють у VideoResult, забираються викликачем
+            '_success_curve': success_curve,
+            '_precision_curve': precision_curve,
+            '_norm_prec_curve': norm_prec_curve,
+            '_ious': ious.astype(np.float32),
         }
 
         return metrics
@@ -1094,7 +1171,8 @@ class ModularEvaluator:
             'median_iou': float(np.median(ious)),
             'tracking_rate': sum(1 for p in pred_bboxes if p) / len(pred_bboxes),
             # Success curve for GOT-10k (101 thresholds from 0 to 1)
-            'succ_curve': [float(np.mean(ious >= t)) for t in np.linspace(0, 1, 101)]
+            'succ_curve': [float(np.mean(ious >= t)) for t in np.linspace(0, 1, 101)],
+            '_ious': ious.astype(np.float32),   # приватне: для --dump-per-frame
         }
 
         return metrics
@@ -1168,6 +1246,8 @@ class ModularEvaluator:
 
         with open(self.summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
+
+        self._save_curves()
 
         overall = summary['overall']
         print(f"\n{'='*70}")
@@ -1338,6 +1418,9 @@ def main():
                         help='GOT-10k subset (val or test, default: val)')
     parser.add_argument('--repetitions', type=int,
                         help='Number of repetitions (GOT-10k default: 3, LaSOT default: 1)')
+    parser.add_argument('--dump-per-frame', action='store_true',
+                        help='Зберегти ще й per-frame IoU у curves_*.npz (для часових профілів). '
+                             'Success/precision криві зберігаються завжди.')
     parser.add_argument('--first', type=int,
                         help='Evaluate first N sequences (for quick testing)')
 
@@ -1434,6 +1517,7 @@ def main():
         dataset=args.dataset,
         resume=args.resume
     )
+    evaluator.dump_per_frame = args.dump_per_frame
 
     # Запуск
     # Обробити test_list_file якщо заданий
