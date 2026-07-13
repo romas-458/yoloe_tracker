@@ -151,5 +151,24 @@ datasets/
 
 # Experiment outputs / logs / weights (regenerable, large)
 results_*/
+results_*_PID.txt
 *.log
 *.pt
+
+# Paper / article drafts and references (kept local, not in VCS)
+*.pdf
+*.docx
+VP_IoU_Tracker_VISNYK.md
+article_g
+
+# Analysis outputs and scratch sequence lists
+*.csv
+lasot_ablation_test_[2-9].txt
+lasot_auc_below_035_sequences.txt
+lasot_worst30_sequences.txt
+lasot_regressed_check.txt
+run.txt
+/2
+
+# Harness transient temp files
+.claude/settings.local.json.tmp*
