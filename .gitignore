@@ -148,3 +148,8 @@ wandb/
 *.avi
 data/
 datasets/
+
+# Experiment outputs / logs / weights (regenerable, large)
+results_*/
+*.log
+*.pt
