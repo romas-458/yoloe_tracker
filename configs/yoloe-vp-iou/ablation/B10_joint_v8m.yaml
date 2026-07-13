@@ -6,13 +6,13 @@
 #   easy-10   R5 +0.004 vs B9 (краще за B9 і за P3-only; basketball-1 +0.046)
 # Примітка: joint у Phase 1 High-Conf Re-ID пробували — регрес (ламає чисті seqs,
 # бо там треба строгий conf-gate); НЕ вмикати для Phase 1.
-name: "B10 Joint"
+name: "B10 Joint (v8m)"
 description: "B9 Full + joint DIoU×conf score (Phase 3 reinit + Phase 2 selection; arithmetic, thr 0.3, lam 0.3/0.0)"
 tracker: "YOLOe-VP-IoU"
-experiment_id: "B10"
+experiment_id: "B10m"
 version: "1.0"
 
-model_path: "yoloe-v8l-seg.pt"
+model_path: "yoloe-v8m-seg.pt"
 imgsz: 640
 device: "cuda"
 

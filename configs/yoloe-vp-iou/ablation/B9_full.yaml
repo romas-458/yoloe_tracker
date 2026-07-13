@@ -5,7 +5,7 @@ tracker: "YOLOe-VP-IoU"
 experiment_id: "B9"
 version: "1.0"
 
-model_path: "yoloe-v8s-seg.pt"
+model_path: "yoloe-v8l-seg.pt"
 imgsz: 640
 device: "cuda"
 
@@ -66,6 +66,12 @@ dual_update_long_term_every: 50
 dual_replace_worst_lt: true
 dual_use_anchor: true
 dual_anchor_weight: 0.1
+
+###
+phase3_appearance_weight: 0.75
+#vpe_anchor_gate_threshold: 0.5
+vpe_gate_threshold: 0.75
+vpe_gate_ref: aggregated #anchor #aggregated #
 
 verbose: false
 debug_frame_step: 10000

@@ -1,0 +1,120 @@
+# ============================================================================
+# C2: −VPE (статичний промпт)  —  leave-one-out від C0_full
+# ============================================================================
+# C-серія відрізняється від B-серії двома речами:
+#
+#  1. МЕТОД. B-серія кумулятивна (B1 baseline → B9 full), тому внесок кожного
+#     компонента залежить від порядку додавання: Kalman (+0.3) і DIoU (+0.8)
+#     виглядали інертними лише тому, що додавались після того, як VPE (+27.9)
+#     вже наситив метрику. C-серія — leave-one-out від повної моделі: кожен
+#     конфіг вимикає РІВНО ОДИН компонент при всіх інших увімкнених.
+#     Разом B-серія (нижня межа) і C-серія (верхня межа) дають чесну вилку.
+#
+#  2. НАБІР. Прогін на `lasot_ablation_subset12.txt`, а не на десятці з
+#     Таблиці 2 (та зміщена на +7 AUC вгору, перебільшує дельти і не містить
+#     жодного відео з Fast Motion).
+#
+# ⚠️ УВАГА, статистика: SE(Δ) на 12 відео ≈ 0.037 при типовому ефекті ~0.035.
+#    Різниці менші за ~0.04 AUC НЕ значущі. Використовувати для скринінгу й
+#    ранжування; фінальні числа брати з повного прогону 280 відео.
+#
+# ⚠️ ДВА БАГИ B-СЕРІЇ, ВИПРАВЛЕНІ ТУТ:
+#    - Phase-1 Re-ID вимикається порогом >= 1.0, а НЕ 0.0. B8 ставив 0.0, що
+#      разом із conf_gap=0.0 (дефолт) робило Re-ID жадібним, а не вимкненим.
+#      Тому "P1 ReID +3.3" зі статті насправді міряв 0.9 проти жадібного 0.0.
+#    - `adaptive_rate` НІДЕ не читається трекером (мертвий ключ). Реальний
+#      параметр — `vpe_conf_adaptive_rate`. У всіх B-конфігах VPE-рампа
+#      працювала на дефолті 5, а не на 500.
+#
+# БАЗА: точний клон B10_v8m_floor08 — конфігурації, яка дала на повних
+# 280 відео AUC 0.5871 @ 41.3 FPS (results_b10m_floor08_full/).
+# Будь-яка зміна тут ламає порівнянність із цим числом.
+# ============================================================================
+name: "C2 −VPE (static prompt)"
+description: "LOO from C0_full: VPE updates frozen (static prompt from frame 1)"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "C2"
+version: "1.0"
+
+model_path: "yoloe-v8m-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# ✅ ADAPTIVE CONFIDENCE
+conf: 0.05
+conf_max: 0.1
+conf_adaptive_rate: 30
+iou_threshold: 0.2
+
+# ✅ VPE
+vpe_step: 999999   # ⬅ C-ABLATION: промпт ніколи не оновлюється після init
+max_vpe: 50            # інертний при dual memory (див. шапку) — лишено як у C0
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.2
+vpe_conf_adaptive_rate: 5     # реальний ключ (дефолт трекера); `adaptive_rate` — мертвий
+adaptive_rate: 500            # DEAD KEY: залишено лише для сумісності з B-конфігами
+
+max_lost_frames: 15
+warmup_frames: 0
+
+# ✅ Phase 2 DIoU
+phase2_diou_threshold: -0.1
+phase2_switch_validation_frames: 1
+waiting_reinit_conf_threshold: 1.00
+waiting_reinit_diou_threshold: -0.5
+
+# ✅ Phase 3 DIoU
+# При use_joint_score=true пороги reinit_conf_threshold / reinit_diou_threshold /
+# reinit_diou_max короткозамкнені (їх замінює joint-бал); reinit_adaptive_rate
+# перевикористовується як темп спадання λ.
+reinit_conf_threshold: 0.3
+reinit_diou_threshold: -0.4
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 25
+phase3_redetection_validation_frames: 1
+phase3_vpe_freeze_frames: 30
+phase3_ref_mode: "last_valid"
+
+# ✅ Phase 1 High Confidence Re-ID   (вимикається значенням 1.0, НЕ 0.0)
+phase1_high_conf_reid_threshold: 0.99
+phase1_high_conf_reid_iou: 0.0
+phase1_high_conf_reid_diou: -0.3
+phase1_high_conf_reid_require_lost: false
+phase1_high_conf_reid_validation_frames: 3
+phase1_high_conf_reid_conf_gap: 0.15
+phase1_high_conf_reid_validation_skip: 0
+
+# ✅ KALMAN
+use_kalman: true
+kalman_process_noise: 0.001
+kalman_measurement_noise: 0.0001
+
+# ✅ DUAL MEMORY VPE
+use_dual_memory_vpe: true
+dual_long_term_capacity: 20
+dual_long_term_quality_threshold: 0.6
+dual_long_term_weight: 0.5
+dual_short_term_capacity: 10
+dual_short_term_weight: 0.5
+dual_temporal_decay: 0.9
+dual_update_long_term_every: 50
+dual_replace_worst_lt: true
+dual_use_anchor: true
+dual_anchor_weight: 0.1
+
+# ✅ VPE GATE + Phase 3 appearance   (обидва вимикаються значенням 0.0)
+phase3_appearance_weight: 0.75
+vpe_gate_threshold: 0.75
+vpe_gate_ref: aggregated
+
+# ⭐ Joint DIoU×conf score (Phase 3 reinit + Phase 2 re-association)
+use_joint_score: true
+joint_mode: arithmetic
+reinit_joint_threshold: 0.3
+joint_lam_start: 0.3
+joint_lam_min: 0.0
+reinit_diou_floor: -0.8       # anti-teleport / anti-distractor floor (sweet spot на Табл.2)
+joint_apply_phase2: true
+
+verbose: false
+debug_frame_step: 10000
