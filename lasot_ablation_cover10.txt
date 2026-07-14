@@ -1,0 +1,14 @@
+# LaSOT ablation COVER subset — 10 послідовностей (max-coverage set-cover)
+# ціль: ≥3/атрибут (≥3 рідкісні), баланс складності, інформативний пул (0.05≤AUC≤0.90)
+# АТРИБУТИ РЕКОНСТРУЙОВАНІ з GT (FOC,OV,LR,ARC,SV,FM,LONG,SHORT); фотометричні недоступні
+#
+airplane-15       # AUC 0.657 easy  n=4500  [ARC,LONG,LR,SV]
+umbrella-19       # AUC 0.651 easy  n=2868  [ARC,SV]
+kite-4            # AUC 0.540 med   n=3223  [ARC,FM,LR,OV,SV]
+fox-20            # AUC 0.475 med   n=4183  [ARC,FOC,LONG,OV,SV]
+elephant-12       # AUC 0.459 med   n=1053  [ARC,FM,FOC,OV,SHORT,SV]
+goldfish-10       # AUC 0.436 hard  n=5602  [ARC,LONG,OV,SV]
+shark-3           # AUC 0.414 hard  n=1000  [ARC,SHORT,SV]
+basketball-1      # AUC 0.358 hard  n=1088  [ARC,LR,SHORT,SV]
+lizard-13         # AUC 0.242 vhard n=2803  [ARC,SV]
+microphone-2      # AUC 0.142 vhard n=4017  [ARC,FM,FOC,LONG,LR,SV]

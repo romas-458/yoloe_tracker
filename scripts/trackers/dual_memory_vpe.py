@@ -81,7 +81,8 @@ class DualMemoryVPE:
         self.total_vpe_collected = 0
         self.lt_updates = 0
 
-    def add_vpe(self, vpe: torch.Tensor, conf: float, frame_id: Optional[int] = None):
+    def add_vpe(self, vpe: torch.Tensor, conf: float, frame_id: Optional[int] = None,
+                allow_short_term: bool = True):
         """
         Додати новий VPE до dual memory
 
@@ -89,6 +90,9 @@ class DualMemoryVPE:
             vpe: VPE tensor [1, 1, D]
             conf: Detection confidence [0-1]
             frame_id: Номер фрейму (опційно)
+            allow_short_term: якщо False — пропустити short-term (state-gated ST:
+                трекер заморозив ST після втрати до впевненого re-lock). anchor/LT
+                логіка (з власним conf-гейтом) не зачіпається.
         """
         if frame_id is None:
             frame_id = self.frame_count
@@ -113,14 +117,15 @@ class DualMemoryVPE:
                 print(f"   ⚠️  Shape mismatch: VPE {vpe.shape} vs anchor {self.anchor_vpe.shape}")
             return
 
-        # 2. Завжди додаємо в short-term (sliding window)
-        self.short_term_vpe.append(vpe.clone())
-        self.short_term_conf.append(conf)
-        self.short_term_age.append(0)  # Вік = 0 для нового VPE
+        # 2. Додаємо в short-term (sliding window) — якщо не заблоковано state-gate-ом
+        if allow_short_term:
+            self.short_term_vpe.append(vpe.clone())
+            self.short_term_conf.append(conf)
+            self.short_term_age.append(0)  # Вік = 0 для нового VPE
 
-        # Збільшуємо вік всіх існуючих ST VPE
-        for i in range(len(self.short_term_age) - 1):
-            self.short_term_age[i] += 1
+            # Збільшуємо вік всіх існуючих ST VPE
+            for i in range(len(self.short_term_age) - 1):
+                self.short_term_age[i] += 1
 
         # 3. Перевірка для додавання в long-term
         should_add_to_lt = (

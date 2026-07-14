@@ -1,0 +1,123 @@
+# ============================================================================
+# D5: D0 + мульти-VPE промпт (anchor + LT + ST як K класів)
+# ============================================================================
+# Це НЕ ще одна абляція. Це фінальна конструкція, з якої треба заново
+# запустити LOO (D-серія) і взяти числа для таблиці. Числа C-серії сюди
+# не переносяться: компоненти не адитивні, і прибравши три з них, ми
+# змінили оточення для решти.
+#
+# ЩО ПРИБРАНО і на якій підставі (внесок / max|Δ| по 12 відео / 95% межа):
+#   • Kalman              +0.0034 / 0.016 / ±0.004  — ефект обмежений зверху 0.016
+#   • Phase-1 Re-ID        0.0000 / 0.000 / ±0.000  — при C0-порозі 0.99 не спрацьовує
+#                                                     жодного разу; навіть при B9-му 0.9
+#                                                     дає -0.004 (C5b)
+#   • phase3_appearance    0.0000 / 0.000 / ±0.000  — 0 з 12 відео реагують
+#   • VPE gate            +0.0018 / 0.021 / ±0.003  — реагує 1 відео з 12
+#
+# ЩО ЗАЛИШЕНО і чому:
+#   • VPE + адаптація промпта   +0.083  (значущий)
+#   • Dual Memory               +0.066  (значущий, б'є по інших відео ніж VPE)
+#   • joint DIoU×conf           +0.076  (значущий)
+#   • anti-teleport floor       свіп: -0.70 краще за -0.80 на +0.022 (tank-9 0.373→0.637)
+#   • адаптивні рампи          +0.011 / max|Δ| 0.161 / ±0.028 — НЕ визначено.
+#     Висока дисперсія означає, що ми гірше знаємо середнє, а не що воно нуль.
+#     Не прибирати, доки не поміряно на повному наборі.
+#   • матчер Phase 2           -0.0005 / 0.031 / ±0.010 — сам по собі ~0, АЛЕ може
+#     бути надлишковим із Kalman-коастингом (обидва ведуть ціль, поки вона не
+#     знайдена). Тут ЗАЛИШЕНИЙ навмисне: Kalman уже вимкнено, тож якщо пара
+#     справді надлишкова, Phase 2 тепер несе цю роботу сам. Перевіряє C14.
+#
+# ГОЛОВНЕ ПОРІВНЯННЯ: D0 проти C12 (= C0 з floor -0.70, AUC 0.6094).
+# Якщо D0 ≈ 0.6094 — скорочення безкоштовне. Якщо нижче — прибрані компоненти
+# разом щось важать, попри те що поодинці кожен давав ~0.
+#
+# ⚠️ Пороги вимкнення тут НЕ інтуїтивні (див. b-series-ablation-protocol-bugs):
+#    Phase-1 Re-ID вимикається 1.0 (а не 0.0); VPE gate — 0.0; appearance — 0.0.
+# ⚠️ `adaptive_rate` і `kalman_*` прибрані як мертві/неактивні ключі.
+# ============================================================================
+name: "D6b = D6 with st_relock_conf 0.3"
+description: "D5 + st_freeze_on_loss: freeze short-term VPE after a loss until high-conf re-lock (anti ST-contamination)"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "D6b"
+version: "1.0"
+
+model_path: "yoloe-v8m-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# ✅ ADAPTIVE CONFIDENCE — залишено (внесок не визначено, не прибирати)
+conf: 0.05
+conf_max: 0.1
+conf_adaptive_rate: 30
+iou_threshold: 0.2
+
+# ✅ VPE + адаптація промпта — найбільший внесок (+0.083)
+vpe_step: 10
+max_vpe: 50
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.2
+vpe_conf_adaptive_rate: 5
+
+max_lost_frames: 15
+warmup_frames: 0
+
+# ✅ Phase 2 — матчер залишено (див. шапку); early-reinit вимкнено порогом 1.00
+phase2_diou_threshold: -0.1
+phase2_switch_validation_frames: 1
+waiting_reinit_conf_threshold: 1.00
+waiting_reinit_diou_threshold: -0.5
+
+# ✅ Phase 3 — під joint-балом пороги conf/diou/max короткозамкнені;
+# reinit_adaptive_rate тут працює як темп спадання λ.
+reinit_conf_threshold: 0.3
+reinit_diou_threshold: -0.4
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 25
+phase3_redetection_validation_frames: 1
+phase3_vpe_freeze_frames: 30
+phase3_ref_mode: "last_valid"
+
+# ❌ ПРИБРАНО: Phase-1 High-Conf Re-ID (1.0 = вимкнено, НЕ 0.0)
+phase1_high_conf_reid_threshold: 1.0
+
+# ❌ ПРИБРАНО: Kalman
+use_kalman: false
+
+# ✅ DUAL MEMORY VPE — значущий (+0.066)
+use_dual_memory_vpe: true
+dual_long_term_capacity: 20
+dual_long_term_quality_threshold: 0.6
+dual_long_term_weight: 0.5
+dual_short_term_capacity: 10
+dual_short_term_weight: 0.5
+dual_temporal_decay: 0.9
+dual_update_long_term_every: 50
+dual_replace_worst_lt: true
+dual_use_anchor: true
+dual_anchor_weight: 0.1
+
+# ⭐ мульти-VPE промпт: anchor + LT + ST як окремі класи детектора
+multi_vpe_prompt: true
+
+# ⭐ state-gated ST: морозити short-term VPE після втрати до впевненого re-lock
+st_freeze_on_loss: true
+st_relock_conf: 0.3
+
+# ❌ ПРИБРАНО: VPE gate і Phase-3 appearance (обидва вимикаються нулем)
+phase3_appearance_weight: 0.0
+vpe_gate_threshold: 0.0
+
+# ✅ Joint DIoU×conf score — значущий (+0.076)
+use_joint_score: true
+joint_mode: arithmetic
+reinit_joint_threshold: 0.3
+joint_lam_start: 0.3
+joint_lam_min: 0.0
+joint_apply_phase2: true
+
+# ✅ Anti-teleport floor — свіп дав -0.70 (краще за -0.80 на +0.022)
+reinit_diou_floor: -0.7
+adaptive_diou_floor: false     # правило v1 ("≥2 впевнених") спростоване, див. C13
+
+verbose: false
+debug_frame_step: 10000

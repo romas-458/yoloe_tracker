@@ -453,6 +453,31 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.multi_vpe_candidates = []  # детекції поточного кадру з їх видом (для візуалізації)
         self.vpe_gate_accepted = 0   # діагностика
         self.vpe_gate_rejected = 0
+        # ⭐ State-gated ST: ST-пам'ять забруднюється, коли після короткої втрати
+        # трекер збирає VPE з низько-conf (часто хибного) боксу — новий вид у multi-VPE
+        # тоді стає магнітом дистракторів і блокує re-detection (basketball-1 0.375→0.016).
+        # LT уже захищений conf-гейтом (>=long_term_quality_threshold); ST — ні (завжди пише).
+        # Фікс: після втрати МОРОЗИМО ST, поки не буде впевненого re-lock (conf>=st_relock_conf).
+        # Нормальне впевнене трекання не зачіпається (adaptation на кшталт zebra зберігається).
+        self.st_freeze_on_loss = kwargs.get('st_freeze_on_loss', False)
+        self.st_relock_conf = kwargs.get('st_relock_conf', 0.5)
+        self._st_frozen = False   # чи ST зараз заморожена (після втрати, до re-lock)
+        # ⭐ ВУЗЬКИЙ ПРОТОТИП: Лукас-Кенеде reference для anti-teleport (Phase 3 joint-gate).
+        # Замість статичного last_valid_bbox — бокс, зсунутий за медіанним LK-потоком точок
+        # цілі, поки триває коротка втрата. Дає РУХОМИЙ prior: приймає швидкий істинний
+        # re-detect уздовж траєкторії, відкидає дистрактор поза нею. Крихко на оклюзії/FM,
+        # тому лише прототип за прапорцем. Див. [[kalman-samurai-roles]] (motion тут інертний).
+        self.use_lk_reference = kwargs.get('use_lk_reference', False)
+        self._lk_prev_gray = None     # попередній кадр (grayscale) для LK
+        self._lk_points = None        # відстежувані точки цілі, [N,1,2] float32
+        self._lk_ref_bbox = None      # LK-пропагований reference bbox [x1,y1,x2,y2]
+        # ⭐ Mask VPE crop: занулити фон (за маскою seg-голови YOLOE) перед енкодингом
+        # VPE, щоб ембединг не містив фон/дистрактор. Атакує ДЖЕРЕЛО ST-контамінації
+        # (бокс після втрати захоплює фон) принциповіше за state-gated ST.
+        # Маски вже майже оплачені seg-моделлю (див. probe). Див. [[multi-vpe-lasot12-redetect-failure]].
+        self.use_mask_vpe_crop = kwargs.get('use_mask_vpe_crop', False)
+        self._frame_masks_xy = None    # полігони масок поточного кадру (orig coords)
+        self._frame_boxes_xyxy = None  # боксы поточного кадру [N,4] (для IoU-матчу маски)
         self.phase3_vpe_freeze_frames = kwargs.get('phase3_vpe_freeze_frames', 0)
         # Режим вибору reference bbox для Phase 3 порівнянь:
         #   'last_valid'    — остання детектована позиція (default, стабільно)
@@ -896,6 +921,10 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.search_candidates = []
         self.current_frame_detections = []
 
+        # LK-reference: зсунути пропагований бокс за оптичним потоком цілі (щокадрово)
+        if self.use_lk_reference:
+            self._lk_propagate(image)
+
         # Зменшити VPE freeze лічильник якщо активний
         if self.phase3_vpe_freeze_counter > 0:
             self.phase3_vpe_freeze_counter -= 1
@@ -984,6 +1013,7 @@ class YOLOeVPIoUTracker(BaseTracker):
             if len(results) == 0 or len(results[0].boxes) == 0:
                 # Немає detections
                 self.lost_frames += 1
+                self._st_frozen = True   # втрата → заморозити ST до впевненого re-lock
 
                 # ⭐ Скинути Phase 3 validation якщо немає detections взагалі
                 # (потрібно строго N послідовних кадрів БЕЗ пропусків)
@@ -1020,6 +1050,13 @@ class YOLOeVPIoUTracker(BaseTracker):
                         return True, [x1, y1, x2 - x1, y2 - y1]
 
             boxes = results[0].boxes
+
+            # mask VPE crop: зберегти маски+боксы кадру для маскованого енкодингу VPE
+            self._frame_masks_xy = None
+            self._frame_boxes_xyxy = None
+            if self.use_mask_vpe_crop and results[0].masks is not None and len(boxes) > 0:
+                self._frame_masks_xy = results[0].masks.xy       # список полігонів (orig coords)
+                self._frame_boxes_xyxy = boxes.xyxy.cpu().numpy()  # [N,4]
 
             # ⭐ Захопити детекції multi-VPE з видом пам'яті (для --visualize):
             # у K-класовому режимі cls кожної детекції = який вид (anchor/LT/ST) її зловив.
@@ -1275,6 +1312,10 @@ class YOLOeVPIoUTracker(BaseTracker):
                 self.lost_frames = 0  # Reset counter
                 self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
+                # LK-reference: пере-засіяти точки на впевненому Phase-1 матчі
+                if self.use_lk_reference and box_conf >= self.st_relock_conf:
+                    self._lk_reseed(image, self.current_bbox)
+
                 # ⭐ Скинути Phase 3 validation якщо вона була активна
                 # (Phase 1 IoU commit перериває Phase 3 validation, тому скидаємо лічильник)
                 if self.in_phase3_validation:
@@ -1398,6 +1439,7 @@ class YOLOeVPIoUTracker(BaseTracker):
                 # IoU < threshold - об'єкт не знайдено за geometric matching
 
                 self.lost_frames += 1
+                self._st_frozen = True   # втрата → заморозити ST до впевненого re-lock
 
                 if self.lost_frames < self.max_lost_frames:
                     # ========================================
@@ -1792,6 +1834,10 @@ class YOLOeVPIoUTracker(BaseTracker):
                         # Остання Kalman предикція з Phase 2 (стабільніша ніж phase3, враховує рух)
                         phase3_ref_bbox = self.phase3_kalman_exit_bbox
                         ref_src_log = "kalman_phase2"
+                    elif self.use_lk_reference and self._lk_ref_bbox is not None:
+                        # LK-пропагований бокс: рухомий anti-teleport prior уздовж траєкторії
+                        phase3_ref_bbox = self._lk_ref_bbox
+                        ref_src_log = "lk"
                     else:
                         # 'last_valid' або fallback: остання детектована позиція
                         phase3_ref_bbox = self.last_valid_bbox
@@ -2221,6 +2267,99 @@ class YOLOeVPIoUTracker(BaseTracker):
                 print(f"      idx={c['idx']}: conf={c['conf']:.3f} sim={c['sim']:.3f} score={c['score']:.3f}{mark}")
         return best
 
+    def _lk_reseed(self, image: np.ndarray, bbox: list):
+        """Пере-засіяти LK-точки всередині впевненого bbox (xyxy) на поточному кадрі."""
+        try:
+            import cv2
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+            h, w = gray.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            self._lk_ref_bbox = list(bbox)
+            self._lk_prev_gray = gray
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                self._lk_points = None
+                return
+            mask = np.zeros_like(gray)
+            mask[y1:y2, x1:x2] = 255
+            pts = cv2.goodFeaturesToTrack(gray, maxCorners=64, qualityLevel=0.01,
+                                          minDistance=3, mask=mask)
+            self._lk_points = pts  # [N,1,2] або None
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  LK reseed error: {e}")
+            self._lk_points = None
+
+    def _lk_propagate(self, image: np.ndarray):
+        """Зсунути _lk_ref_bbox за медіанним оптичним потоком точок (кадр→кадр)."""
+        if self._lk_prev_gray is None or self._lk_points is None or len(self._lk_points) == 0:
+            # немає з чого рахувати — лише оновити prev
+            try:
+                import cv2
+                self._lk_prev_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                pass
+            return
+        try:
+            import cv2
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            nxt, st, _ = cv2.calcOpticalFlowPyrLK(self._lk_prev_gray, gray,
+                                                  self._lk_points, None,
+                                                  winSize=(15, 15), maxLevel=2)
+            if nxt is not None and st is not None:
+                good_new = nxt[st.flatten() == 1]
+                good_old = self._lk_points[st.flatten() == 1]
+                if len(good_new) >= 3:
+                    flow = good_new.reshape(-1, 2) - good_old.reshape(-1, 2)
+                    dx, dy = float(np.median(flow[:, 0])), float(np.median(flow[:, 1]))
+                    if self._lk_ref_bbox is not None:
+                        x1, y1, x2, y2 = self._lk_ref_bbox
+                        self._lk_ref_bbox = [x1 + dx, y1 + dy, x2 + dx, y2 + dy]
+                    self._lk_points = good_new.reshape(-1, 1, 2)
+                else:
+                    self._lk_points = None  # трек розсипався
+            self._lk_prev_gray = gray
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  LK propagate error: {e}")
+            self._lk_points = None
+
+    def _mask_bg_in_crop(self, image: np.ndarray, bbox: list) -> np.ndarray:
+        """
+        Повернути копію кадру, де фон УСЕРЕДИНІ bbox занулено за маскою цілі
+        (детекція з найбільшим IoU до bbox). Поза bbox кадр не чіпаємо — предиктор
+        і так фокусується на боксі. Якщо маски немає / не знайдено збіг — оригінал.
+        """
+        if self._frame_masks_xy is None or self._frame_boxes_xyxy is None:
+            return image
+        try:
+            import cv2
+            # знайти детекцію, найближчу за IoU до bbox збору
+            ious = np.array([self._compute_iou(bbox, b.tolist()) for b in self._frame_boxes_xyxy])
+            if len(ious) == 0 or ious.max() < 0.3:
+                return image
+            idx = int(ious.argmax())
+            poly = self._frame_masks_xy[idx]
+            if poly is None or len(poly) < 3:
+                return image
+            H, W = image.shape[:2]
+            m = np.zeros((H, W), np.uint8)
+            cv2.fillPoly(m, [poly.astype(np.int32)], 1)
+            x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W, x2), min(H, y2)
+            if x2 - x1 < 2 or y2 - y1 < 2:
+                return image
+            out = image.copy()
+            crop = out[y1:y2, x1:x2]
+            crop[m[y1:y2, x1:x2] == 0] = 0   # занулити фон усередині bbox
+            return out
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  mask VPE crop error: {e}")
+            return image
+
     def _collect_vpe(self, image: np.ndarray, bbox: list, conf: float = 0.5):
         """
         Зібрати VPE з поточного кадру
@@ -2237,12 +2376,18 @@ class YOLOeVPIoUTracker(BaseTracker):
                 cls=np.array([0]),
             )
 
+            # mask VPE crop: занулити фон усередині bbox за маскою цілі, щоб
+            # ембединг не містив фон/дистрактор (джерело ST-контамінації)
+            enc_image = image
+            if self.use_mask_vpe_crop:
+                enc_image = self._mask_bg_in_crop(image, bbox)
+
             # Виділений VPE-предиктор: ОДИН forward (get_vpe) замість двох
             # (раніше повний model.predict запускався лише щоб створити predictor,
             #  а його результат не використовувався)
             vp = self._get_vpe_predictor()
             vp.set_prompts(visual_prompts)
-            vpe = vp.get_vpe(image)
+            vpe = vp.get_vpe(enc_image)
 
             # Validate VPE
             if vpe is None:
@@ -2267,10 +2412,23 @@ class YOLOeVPIoUTracker(BaseTracker):
                         return
                     self.vpe_gate_accepted += 1
 
+            # State-gated ST: після втрати не пишемо в ST, поки не буде впевненого
+            # re-lock — інакше низько-conf (часто хибний) бокс забруднює ST.
+            allow_st = True
+            if self.st_freeze_on_loss and self._st_frozen:
+                if conf >= self.st_relock_conf:
+                    self._st_frozen = False   # впевнений re-lock → розморозити
+                    if self.verbose:
+                        print(f"   🔓 ST розморожено (conf={conf:.3f} >= {self.st_relock_conf})")
+                else:
+                    allow_st = False          # ще відновлюємось → не забруднювати ST
+                    if self.verbose:
+                        print(f"   ❄️  ST заморожено (conf={conf:.3f} < {self.st_relock_conf}, після втрати)")
+
             # Додати до dual memory або simple deque
             if self.use_dual_memory_vpe:
                 # Використовувати conf від detection (SAMURAI affinity або detection conf)
-                self.dual_memory.add_vpe(vpe, conf, self.frame_count)
+                self.dual_memory.add_vpe(vpe, conf, self.frame_count, allow_short_term=allow_st)
 
                 if self.verbose:
                     stats = self.dual_memory.get_stats()
@@ -2595,6 +2753,12 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.aggregated_vpe = None
         self.last_valid_bbox = None
         self.lost_frames = 0
+        self._st_frozen = False
+        self._lk_prev_gray = None
+        self._lk_points = None
+        self._lk_ref_bbox = None
+        self._frame_masks_xy = None
+        self._frame_boxes_xyxy = None
         self.vpe_pending = False
         self.rejected_candidates = []
         self.search_candidates = []
