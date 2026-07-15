@@ -462,6 +462,19 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.st_freeze_on_loss = kwargs.get('st_freeze_on_loss', False)
         self.st_relock_conf = kwargs.get('st_relock_conf', 0.5)
         self._st_frozen = False   # чи ST зараз заморожена (після втрати, до re-lock)
+        # ⭐ ЕСКАЛАЦІЯ multi-VPE: single-промпт поки трек здоровий; K-класовий
+        # multi-VPE вмикається ЛИШЕ після тривалої втрати (як інструмент
+        # re-detection) і вимикається після стабільного re-lock. Мотивація
+        # (oracle-аналіз D0 vs D6b на LaSOT-280): multi-VPE виграє майже
+        # виключно там, де single ПРОВАЛЮЄТЬСЯ (rescue: book-19, robot-8,
+        # train-11), і програє там, де single ПРАЦЮЄ (hijack: cattle-2,
+        # sepia-13) — тож даємо зайві класи тільки загубленому трекеру.
+        # Див. [[multi-vpe-lasot12-redetect-failure]].
+        self.multi_vpe_escalate = kwargs.get('multi_vpe_escalate', False)
+        self.escalate_after_lost = kwargs.get('escalate_after_lost', 45)
+        self.deescalate_after_stable = kwargs.get('deescalate_after_stable', 30)
+        self._escalated = False      # чи зараз активний ескальований multi-промпт
+        self._stable_frames = 0      # поспіль кадрів з успішним матчем (для деескалації)
         # ⭐ ВУЗЬКИЙ ПРОТОТИП: Лукас-Кенеде reference для anti-teleport (Phase 3 joint-gate).
         # Замість статичного last_valid_bbox — бокс, зсунутий за медіанним LK-потоком точок
         # цілі, поки триває коротка втрата. Дає РУХОМИЙ prior: приймає швидкий істинний
@@ -921,6 +934,26 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.search_candidates = []
         self.current_frame_detections = []
 
+        # ⭐ Ескалація multi-VPE: оновити стан ДО побудови промпта цього кадру.
+        # lost_frames тут відображає результат ПОПЕРЕДНЬОГО кадру.
+        if self.multi_vpe_escalate:
+            if self.lost_frames == 0:
+                self._stable_frames += 1
+            else:
+                self._stable_frames = 0
+            if not self._escalated and self.lost_frames >= self.escalate_after_lost:
+                self._escalated = True
+                self._applied_vpe_version = None   # форс-перебудова промпта
+                if self.verbose:
+                    print(f"🚨 Кадр {self.frame_count}: ескалація до multi-VPE "
+                          f"(lost={self.lost_frames} >= {self.escalate_after_lost})")
+            elif self._escalated and self._stable_frames >= self.deescalate_after_stable:
+                self._escalated = False
+                self._applied_vpe_version = None   # назад до single-агрегату
+                if self.verbose:
+                    print(f"✅ Кадр {self.frame_count}: деескалація до single VPE "
+                          f"(stable={self._stable_frames})")
+
         # LK-reference: зсунути пропагований бокс за оптичним потоком цілі (щокадрово)
         if self.use_lk_reference:
             self._lk_propagate(image)
@@ -966,7 +999,11 @@ class YOLOeVPIoUTracker(BaseTracker):
                 # оновився після _aggregate_vpe (а не на кожному кадрі)
                 if self._applied_vpe_version != self._vpe_version:
                     self.model.is_fused = lambda: False
-                    multi_emb = self._build_multi_vpe() if self.multi_vpe_prompt else None
+                    # multi-промпт: або постійний (multi_vpe_prompt), або
+                    # ескальований після тривалої втрати (multi_vpe_escalate)
+                    use_multi = self.multi_vpe_prompt or \
+                        (self.multi_vpe_escalate and self._escalated)
+                    multi_emb = self._build_multi_vpe() if use_multi else None
                     if multi_emb is not None and multi_emb.size(1) > 1:
                         # Мульти-VPE: K класів (anchor/LT/ST) -> об'єднання кандидатів
                         self.model.set_classes(list(range(multi_emb.size(1))), multi_emb)
@@ -2754,6 +2791,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.last_valid_bbox = None
         self.lost_frames = 0
         self._st_frozen = False
+        self._escalated = False
+        self._stable_frames = 0
         self._lk_prev_gray = None
         self._lk_points = None
         self._lk_ref_bbox = None
