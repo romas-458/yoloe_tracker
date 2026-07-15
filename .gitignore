@@ -172,3 +172,7 @@ run.txt
 
 # Harness transient temp files
 .claude/settings.local.json.tmp*
+
+# Downloaded model assets (large, regenerable)
+*.ts
+mobileclip_*.ts

@@ -480,6 +480,14 @@ class ModularEvaluator:
                 continue
 
             if idx == 0:
+                # Текст-якір: якщо трекер підтримує, передати опис із nlp.txt
+                if hasattr(tracker, "set_text_prompt"):
+                    nlp_file = video_path / "nlp.txt"
+                    if nlp_file.exists():
+                        try:
+                            tracker.set_text_prompt(nlp_file.read_text().strip())
+                        except Exception:
+                            pass
                 # Ініціалізація
                 init_bbox = groundtruth[0]
                 success = tracker.initialize(image, init_bbox)

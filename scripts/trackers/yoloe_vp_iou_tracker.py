@@ -475,6 +475,15 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.deescalate_after_stable = kwargs.get('deescalate_after_stable', 30)
         self._escalated = False      # чи зараз активний ескальований multi-промпт
         self._stable_frames = 0      # поспіль кадрів з успішним матчем (для деескалації)
+        # ⭐ ТЕКСТ-ЯКІР: злити текстовий промпт (з опису послідовності, nlp.txt) із
+        # візуальним VPE як зважене середнє. YOLOe вирівнює VPE і text-PE в один
+        # простір (виміряно cos 0.17–0.48). Текст діє семантичним якорем: коли VPE
+        # дрейфує при зміні вигляду, тягне промпт назад до категорії. На відміну
+        # від ST, текст НЕ забруднюється поганим кадром. Режим A: один клас, малий
+        # α (біас, не окремий канал детекції) → нижчий ризик hijack, ніж multi-клас.
+        self.text_prompt_fusion = kwargs.get('text_prompt_fusion', False)
+        self.text_fusion_weight = kwargs.get('text_fusion_weight', 0.25)  # α
+        self._text_pe = None         # нормований text-PE [1,1,D] або None
         # ⭐ ВУЗЬКИЙ ПРОТОТИП: Лукас-Кенеде reference для anti-teleport (Phase 3 joint-gate).
         # Замість статичного last_valid_bbox — бокс, зсунутий за медіанним LK-потоком точок
         # цілі, поки триває коротка втрата. Дає РУХОМИЙ prior: приймає швидкий істинний
@@ -1011,7 +1020,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                         if self.verbose:
                             print(f"   🧩 Мульти-VPE промпт: K={multi_emb.size(1)} представлень")
                     else:
-                        self.model.set_classes([0], self.aggregated_vpe)  # Use int instead of string
+                        prompt_emb = self._fuse_text_anchor(self.aggregated_vpe)
+                        self.model.set_classes([0], prompt_emb)  # Use int instead of string
                         self._multi_vpe_active = False
                     self._applied_vpe_version = self._vpe_version
 
@@ -2198,6 +2208,47 @@ class YOLOeVPIoUTracker(BaseTracker):
             )
             self._vpe_predictor.setup_model(self.model.model, verbose=False)
         return self._vpe_predictor
+
+    def set_text_prompt(self, text: str):
+        """
+        Задати текстовий опис послідовності (напр. з nlp.txt) для текст-якоря.
+        Обчислює нормований text-PE один раз (важкий MobileCLIP-forward) і кешує.
+        Викликається eval-гарнесом перед initialize, якщо text_prompt_fusion=True.
+        Тихо ігнорується, якщо fusion вимкнено або текст порожній.
+        """
+        if not self.text_prompt_fusion or not text or not text.strip():
+            return
+        try:
+            tpe = self.model.get_text_pe([text.strip()])  # [1, 1, D]
+            self._text_pe = F.normalize(tpe.float(), p=2, dim=-1)
+            if self.verbose:
+                print(f"   📝 Текст-якір встановлено: «{text.strip()}» (α={self.text_fusion_weight})")
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  set_text_prompt error: {e}")
+            self._text_pe = None
+
+    def _fuse_text_anchor(self, vpe):
+        """
+        Режим A: злити VPE з text-якорем як зважене середнє й renormalize.
+        final = normalize((1-α)·V̂ + α·T̂). Обидва попередньо L2-нормовані, щоб
+        α була справжньою вагою напрямків, а не масштабів. Повертає vpe без змін,
+        якщо fusion вимкнено / немає text-PE / форми не збігаються.
+        """
+        if not self.text_prompt_fusion or self._text_pe is None or vpe is None:
+            return vpe
+        try:
+            if self._text_pe.shape[-1] != vpe.shape[-1]:
+                return vpe
+            a = float(self.text_fusion_weight)
+            v = F.normalize(vpe.float(), p=2, dim=-1)
+            t = self._text_pe.to(v.device)
+            fused = (1.0 - a) * v + a * t
+            return F.normalize(fused, p=2, dim=-1)
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  _fuse_text_anchor error: {e}")
+            return vpe
 
     def _build_multi_vpe(self):
         """
