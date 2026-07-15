@@ -1,0 +1,125 @@
+# ============================================================================
+# D9: D0 + ЕСКАЛАЦІЙНИЙ multi-VPE (multi лише як інструмент re-detection)
+# ============================================================================
+# Мотивація — oracle-аналіз D0 vs D6b на LaSOT-280 (2026-07-14):
+#   • oracle max(D0,D6b) = 60.25 (+1.77 над D0 58.5) — виграш сконцентрований
+#     (топ-10 відео = 61% приросту), тобто це окремий механізм, не шум.
+#   • АСИМЕТРІЯ: multi виграє майже виключно де single ПРОВАЛЮЄТЬСЯ
+#     (D0<0.3: 10 виграшів vs 3 програші, +0.032) — rescue після втрати
+#     (book-19 +0.591, robot-8 +0.558, train-11 +0.495);
+#     і програє де single ПРАЦЮЄ (D0>0.5: 7 vs 22, −0.02..−0.035) —
+#     hijack здорового треку зайвим ST-класом (cattle-2 −0.561, sepia-13 −0.500).
+#   • Навіть сліпе правило «multi якщо D0<0.4» дає +0.9 AUC.
+#
+# ПОЛІТИКА: старт = single VPE (D0). Якщо lost_frames >= escalate_after_lost —
+# перебудувати промпт у K класів (anchor + LT + заморожений pre-loss ST) для
+# re-detection. Після deescalate_after_stable поспіль успішних кадрів —
+# назад до single. Здорові треки НІКОЛИ не бачать зайвих класів → hijack-
+# втрати зникають за побудовою; rescue-виграші зберігаються.
+#
+# D9b: escalate_after_lost=14 = max_lost(15)−1 — multi-промпт активний уже для
+# ПЕРШОЇ спроби Phase 3. Мотивація (діагностика D9 на book-19): Phase 3 hijack-ає
+# дистрактора на ~15-му кадрі втрати (кадр 992: conf=0.768, val 1 кадр PASSED),
+# після чого внутрішній стан бездоганний і пам'ять отруюється (збір VPE з
+# дистрактора @conf 0.96) — ескалація на 45 (D9) НІКОЛИ не встигає (probe:
+# rescue 1/8). Вікно rescue — ПЕРШИЙ re-detect: замерзлий pre-loss ST-вид
+# (book-19: деформована книжка, останній збір ~кадр 975) має перебити
+# дистрактора в joint score. Hijack-захист слабшає, але multi як і раніше
+# активний лише у вікнах реальної втрати.
+#
+# Probe: lasot_probe16.txt — D9 дав rescue 1/8, hijack-захист 7/8.
+# D9b має підняти rescue, не втративши hijack-захист.
+# ============================================================================
+name: "D11 = D0-minimal + test-time VPE augmentation"
+description: "single VPE while healthy; escalate to anchor+LT+frozen-ST multi-prompt after prolonged loss; de-escalate after stable re-lock"
+tracker: "YOLOe-VP-IoU"
+experiment_id: "D11"
+version: "1.0"
+
+model_path: "yoloe-v8m-seg.pt"
+imgsz: 640
+device: "cuda"
+
+# ✅ ADAPTIVE CONFIDENCE — залишено (внесок не визначено, не прибирати)
+conf: 0.05
+conf_max: 0.1
+conf_adaptive_rate: 30
+iou_threshold: 0.2
+
+# ✅ VPE + адаптація промпта — найбільший внесок (+0.083)
+vpe_step: 10
+max_vpe: 50
+vpe_conf_threshold: 0.05
+vpe_conf_max: 0.2
+vpe_conf_adaptive_rate: 5
+
+max_lost_frames: 15
+warmup_frames: 0
+
+# ✅ Phase 2 — матчер залишено; early-reinit вимкнено порогом 1.00
+phase2_diou_threshold: -0.1
+phase2_switch_validation_frames: 1
+waiting_reinit_conf_threshold: 1.00
+waiting_reinit_diou_threshold: -0.5
+
+# ✅ Phase 3 — під joint-балом пороги conf/diou/max короткозамкнені;
+# reinit_adaptive_rate тут працює як темп спадання λ.
+reinit_conf_threshold: 0.3
+reinit_diou_threshold: -0.4
+reinit_diou_max: -0.9
+reinit_adaptive_rate: 25
+phase3_redetection_validation_frames: 1
+phase3_vpe_freeze_frames: 30
+phase3_ref_mode: "last_valid"
+
+# ❌ ПРИБРАНО: Phase-1 High-Conf Re-ID (1.0 = вимкнено, НЕ 0.0)
+phase1_high_conf_reid_threshold: 1.0
+
+# ❌ ПРИБРАНО: Kalman
+use_kalman: false
+
+# ✅ DUAL MEMORY VPE — значущий (+0.066)
+use_dual_memory_vpe: true
+dual_long_term_capacity: 20
+dual_long_term_quality_threshold: 0.6
+dual_long_term_weight: 0.5
+dual_short_term_capacity: 10
+dual_short_term_weight: 0.5
+dual_temporal_decay: 0.9
+dual_update_long_term_every: 50
+dual_replace_worst_lt: true
+dual_use_anchor: true
+dual_anchor_weight: 0.1
+
+# ⭐ D9: multi-VPE НЕ постійний — лише ескалація після тривалої втрати
+multi_vpe_prompt: false
+multi_vpe_escalate: false
+escalate_after_lost: 14   # = max_lost(15)-1: multi активний уже для ПЕРШОЇ спроби Phase 3
+deescalate_after_stable: 30    # поспіль успішних кадрів до повернення в single
+
+# ⭐ state-gated ST: морозити short-term VPE після втрати до впевненого re-lock
+# (в ескалації критично: ST-вид у multi-промпті = pre-loss вигляд, не сміття)
+st_freeze_on_loss: true
+st_relock_conf: 0.3
+
+# ❌ ПРИБРАНО: VPE gate і Phase-3 appearance (обидва вимикаються нулем)
+phase3_appearance_weight: 0.0
+vpe_gate_threshold: 0.0
+
+# ✅ Joint DIoU×conf score — значущий (+0.076)
+use_joint_score: true
+joint_mode: arithmetic
+reinit_joint_threshold: 0.3
+joint_lam_start: 0.3
+joint_lam_min: 0.0
+joint_apply_phase2: true
+
+# ✅ Anti-teleport floor — свіп дав -0.70 (краще за -0.80 на +0.022)
+reinit_diou_floor: -0.7
+adaptive_diou_floor: false
+
+verbose: false
+debug_frame_step: 10000
+
+# ⭐ D11: test-time VPE аугментація (flip + фотометрія, instance-specific)
+vpe_tta: true

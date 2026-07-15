@@ -484,6 +484,27 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.text_prompt_fusion = kwargs.get('text_prompt_fusion', False)
         self.text_fusion_weight = kwargs.get('text_fusion_weight', 0.25)  # α
         self._text_pe = None         # нормований text-PE [1,1,D] або None
+        # ⭐ TEST-TIME VPE АУГМЕНТАЦІЯ (натхнення OVTrack [17] hallucination, але
+        # training-free): кодувати VPE не з одного crop'а, а з кількох instance-
+        # preserving трансформацій цілі (flip + фотометрія) й усереднити. Робить
+        # ембединг інваріантним до дзеркала/освітлення, ЛИШАЮЧИСЬ instance-specific
+        # (не тягне до категорії, на відміну від тексту/multi-VPE). Ризик: те саме
+        # broadening→дистрактор, тож за прапорцем. Див. [[text-prompt-anchor-equals-multivpe]].
+        self.vpe_tta = kwargs.get('vpe_tta', False)
+        # ⭐ ДИСТРАКТОР-ПАМ'ЯТЬ (KeepTrack-lite, training-free): пам'ятати, де
+        # НЕ-ціль. Поки трек здоровий (Phase 1), відхилені детекції ведуться як
+        # дешеві tracklet'и (лише координати). На Phase-3 re-init кандидат, що
+        # ПРОДОВЖУЄ дистрактор-tracklet крізь вікно втрати, штрафується в joint
+        # score (м'який penalty, не вето). Третя вісь: не appearance (вичерпано,
+        # 4 фальсифікації) і не velocity (Kalman/LK мертві), а просторова
+        # тяглість не-цілей. Атакує механізм book-19/cattle-2: хибний об'єкт
+        # існував як rejected-детекція ще ДО втрати.
+        self.use_distractor_memory = kwargs.get('use_distractor_memory', False)
+        self.distractor_penalty_weight = kwargs.get('distractor_penalty_weight', 0.6)
+        self.distractor_track_max_age = kwargs.get('distractor_track_max_age', 60)   # кадрів без апдейту до видалення
+        self.distractor_track_min_hits = kwargs.get('distractor_track_min_hits', 3)  # мін. спостережень, щоб штрафувати
+        self.distractor_assoc_iou = kwargs.get('distractor_assoc_iou', 0.3)          # IoU асоціації детекція↔track
+        self._distractor_tracks = []   # [{'bbox': xyxy, 'last_frame': int, 'hits': int}]
         # ⭐ ВУЗЬКИЙ ПРОТОТИП: Лукас-Кенеде reference для anti-teleport (Phase 3 joint-gate).
         # Замість статичного last_valid_bbox — бокс, зсунутий за медіанним LK-потоком точок
         # цілі, поки триває коротка втрата. Дає РУХОМИЙ prior: приймає швидкий істинний
@@ -1359,6 +1380,11 @@ class YOLOeVPIoUTracker(BaseTracker):
                 self.lost_frames = 0  # Reset counter
                 self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
+                # ⭐ Дистрактор-пам'ять: на здоровому кадрі всі НЕ-цільові детекції
+                # оновлюють/створюють tracklet'и (ціль виключено за best_iou_idx)
+                if self.use_distractor_memory:
+                    self._update_distractor_tracks(boxes, target_idx=best_iou_idx)
+
                 # LK-reference: пере-засіяти точки на впевненому Phase-1 матчі
                 if self.use_lk_reference and box_conf >= self.st_relock_conf:
                     self._lk_reseed(image, self.current_bbox)
@@ -1484,6 +1510,13 @@ class YOLOeVPIoUTracker(BaseTracker):
 
             else:
                 # IoU < threshold - об'єкт не знайдено за geometric matching
+
+                # ⭐ Дистрактор-пам'ять під час втрати: ЛИШЕ асоціація до існуючих
+                # tracklet'ів (нових не створюємо — ідентичність детекцій невідома,
+                # ціль могла з'явитись знову). Стабільний дистрактор, що детектиться
+                # на місці, продовжує свій tracklet крізь вікно втрати.
+                if self.use_distractor_memory:
+                    self._update_distractor_tracks(boxes, target_idx=None)
 
                 self.lost_frames += 1
                 self._st_frozen = True   # втрата → заморозити ST до впевненого re-lock
@@ -1950,10 +1983,20 @@ class YOLOeVPIoUTracker(BaseTracker):
                                     'bbox': [x1, y1, x2 - x1, y2 - y1],
                                     'conf': box_conf, 'diou': diou})
                                 continue
+                            score = self._joint_score(box_conf, diou, lam)
+                            # ⭐ Дистрактор-penalty: кандидат, що продовжує живий
+                            # дистрактор-tracklet, штрафується пропорційно перекриттю
+                            # (м'яко, не вето — щоб не вбити re-detect на перетині траєкторій)
+                            if self.use_distractor_memory:
+                                dt_iou = self._distractor_overlap(box_xyxy)
+                                if dt_iou > 0.0:
+                                    score *= (1.0 - self.distractor_penalty_weight * dt_iou)
+                                    if self.verbose:
+                                        print(f"   🚧 Дистрактор-penalty: dt_iou={dt_iou:.3f} → score={score:.3f}")
                             joint_eligible.append({
                                 'idx': idx, 'conf': box_conf, 'xyxy': box_xyxy,
                                 'diou': diou,
-                                'score': self._joint_score(box_conf, diou, lam)})
+                                'score': score})
 
                         if self.verbose and joint_eligible:
                             print(f"   🔍 Фаза 3 [joint λ={lam:.2f}, {self.joint_mode}, thr={self.reinit_joint_threshold}, floor={diou_floor}]: {len(joint_eligible)} кандидатів:")
@@ -2448,6 +2491,40 @@ class YOLOeVPIoUTracker(BaseTracker):
                 print(f"   ⚠️  mask VPE crop error: {e}")
             return image
 
+    def _get_vpe_tta(self, vp, image: np.ndarray, bbox: list):
+        """
+        Test-time аугментація VPE: закодувати ціль з кількох instance-preserving
+        трансформацій (оригінал + гор. флип + фотометрія ±20%) і повернути
+        L2-нормоване середнє. Зберігає ідентичність екземпляра, додаючи
+        інваріантність до дзеркала/освітлення. Падає назад на одиничний VPE,
+        якщо аугментації не дали жодного валідного ембедингу.
+        """
+        H, W = image.shape[:2]
+        x1, y1, x2, y2 = bbox
+        views = []
+        # (трансформоване зображення, трансформований bbox)
+        views.append((image, [x1, y1, x2, y2]))
+        # горизонтальний флип: дзеркалимо зображення й bbox по X
+        flipped = image[:, ::-1].copy()
+        views.append((flipped, [W - x2, y1, W - x1, y2]))
+        # фотометрія: яскравіше / темніше (bbox без змін)
+        views.append((np.clip(image.astype(np.float32) * 1.2, 0, 255).astype(np.uint8), [x1, y1, x2, y2]))
+        views.append((np.clip(image.astype(np.float32) * 0.8, 0, 255).astype(np.uint8), [x1, y1, x2, y2]))
+
+        embs = []
+        for img_v, box_v in views:
+            try:
+                vp.set_prompts(dict(bboxes=np.array([box_v]), cls=np.array([0])))
+                e = vp.get_vpe(img_v)
+                if e is not None:
+                    embs.append(F.normalize(e.float(), p=2, dim=-1))
+            except Exception:
+                continue
+        if not embs:
+            return None
+        avg = torch.stack(embs, dim=0).mean(dim=0)
+        return F.normalize(avg, p=2, dim=-1)
+
     def _collect_vpe(self, image: np.ndarray, bbox: list, conf: float = 0.5):
         """
         Зібрати VPE з поточного кадру
@@ -2474,8 +2551,11 @@ class YOLOeVPIoUTracker(BaseTracker):
             # (раніше повний model.predict запускався лише щоб створити predictor,
             #  а його результат не використовувався)
             vp = self._get_vpe_predictor()
-            vp.set_prompts(visual_prompts)
-            vpe = vp.get_vpe(enc_image)
+            if self.vpe_tta:
+                vpe = self._get_vpe_tta(vp, enc_image, bbox)
+            else:
+                vp.set_prompts(visual_prompts)
+                vpe = vp.get_vpe(enc_image)
 
             # Validate VPE
             if vpe is None:
@@ -2742,6 +2822,65 @@ class YOLOeVPIoUTracker(BaseTracker):
 
         return current_threshold
 
+    def _update_distractor_tracks(self, boxes, target_idx=None):
+        """
+        Оновити дистрактор-tracklet'и детекціями поточного кадру.
+        target_idx задано (здоровий кадр): усі детекції, крім цілі та тих, що
+        сильно перекривають ціль, асоціюються з існуючими tracklet'ами (IoU >=
+        distractor_assoc_iou) або створюють нові.
+        target_idx=None (втрата): ЛИШЕ асоціація — нових tracklet'ів не створюємо.
+        Старі tracklet'и (без апдейту > distractor_track_max_age) видаляються.
+        """
+        try:
+            frame = self.frame_count
+            target_xyxy = None
+            if target_idx is not None:
+                target_xyxy = boxes[target_idx].xyxy[0].cpu().numpy().tolist()
+            for idx, box in enumerate(boxes):
+                if target_idx is not None and idx == target_idx:
+                    continue
+                det = box.xyxy[0].cpu().numpy().tolist()
+                # не вести tracklet по боксах, що фактично і є ціллю (дубль-детекції)
+                if target_xyxy is not None and self._compute_iou(det, target_xyxy) >= 0.5:
+                    continue
+                best_t, best_iou = None, self.distractor_assoc_iou
+                for t in self._distractor_tracks:
+                    iou = self._compute_iou(det, t['bbox'])
+                    if iou >= best_iou:
+                        best_t, best_iou = t, iou
+                if best_t is not None:
+                    best_t['bbox'] = det
+                    best_t['last_frame'] = frame
+                    best_t['hits'] += 1
+                elif target_idx is not None:
+                    # нові tracklet'и лише на здорових кадрах (відома ідентичність)
+                    self._distractor_tracks.append(
+                        {'bbox': det, 'last_frame': frame, 'hits': 1})
+            # прибрати застарілі
+            self._distractor_tracks = [
+                t for t in self._distractor_tracks
+                if frame - t['last_frame'] <= self.distractor_track_max_age]
+        except Exception as e:
+            if self.verbose:
+                print(f"   ⚠️  distractor tracks update error: {e}")
+
+    def _distractor_overlap(self, cand_xyxy) -> float:
+        """
+        Максимальний IoU кандидата з ЖИВИМИ штрафувальними tracklet'ами
+        (hits >= min_hits — відсіює одноразові FP; бачені нещодавно).
+        """
+        frame = self.frame_count
+        best = 0.0
+        for t in self._distractor_tracks:
+            if t['hits'] < self.distractor_track_min_hits:
+                continue
+            if frame - t['last_frame'] > self.distractor_track_max_age:
+                continue
+            iou = self._compute_iou(list(cand_xyxy), t['bbox'])
+            if iou > best:
+                best = iou
+        return best
+
     def _compute_iou(self, bbox1, bbox2):
         """IoU між двома bbox [x1, y1, x2, y2]"""
         x1_1, y1_1, x2_1, y2_1 = bbox1
@@ -2844,6 +2983,7 @@ class YOLOeVPIoUTracker(BaseTracker):
         self._st_frozen = False
         self._escalated = False
         self._stable_frames = 0
+        self._distractor_tracks = []
         self._lk_prev_gray = None
         self._lk_points = None
         self._lk_ref_bbox = None

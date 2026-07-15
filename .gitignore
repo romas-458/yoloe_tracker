@@ -159,7 +159,8 @@ results_*_PID.txt
 *.pdf
 *.docx
 VP_IoU_Tracker_VISNYK.md
-article_g
+article_g*
+lit_analys
 
 # Analysis outputs and scratch sequence lists
 *.csv
