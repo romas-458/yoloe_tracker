@@ -59,6 +59,40 @@ plt.rcParams.update({
 
 TRACKS = [('anchor', BLUE), ('LT', AQUA), ('ST', RED), ('agg', PLUM)]
 
+# Фази трекера (та сама логіка, що в get_debug_info: чиста функція від lost_frames)
+AMBER, ROSE = '#d98a1f', '#c94b52'
+PHASES = {1: ('Phase 1: IoU', '#cfd8cf'), 2: ('Phase 2: очікування', AMBER),
+          3: ('Phase 3: ре-ID', ROSE)}
+
+# Стан за ground-truth — те, що є НАСПРАВДІ, незалежно від думки трекера.
+ON, DRIFT, LOST, UNK = 0, 1, 2, 3
+GT_STATES = {ON: ('на цілі (IoU>0.5)', '#0f9068'), DRIFT: ('дрейф (0.1–0.5)', '#d9b84f'),
+             LOST: ('не на цілі (IoU<0.1)', '#c0392b'), UNK: ('немає даних', '#d5d4cd')}
+
+
+def gt_state(i: float) -> int:
+    """Реальний стан за IoU до GT. nan (нема GT або трекер не дав бокс) → UNK."""
+    if np.isnan(i):
+        return UNK
+    return ON if i > 0.5 else (LOST if i < 0.1 else DRIFT)
+
+
+def phase_of(tracker) -> int:
+    """1 — трек живий, 2 — втрачено але ще чекаємо, 3 — ре-ідентифікація."""
+    lost = getattr(tracker, 'lost_frames', 0)
+    if lost == 0:
+        return 1
+    return 2 if lost < getattr(tracker, 'max_lost_frames', 1) else 3
+
+
+def runs(values):
+    """Послідовність → (i_start, i_end_inclusive, value) для суміжних однакових ділянок."""
+    start = 0
+    for i in range(1, len(values) + 1):
+        if i == len(values) or values[i] != values[start]:
+            yield start, i - 1, values[start]
+            start = i
+
 
 def find_video(data_dir: Path, video: str) -> Path:
     """LaSOT: <data>/<class-dir>/<class>-<n>/. Приймає і повний шлях.
@@ -195,7 +229,7 @@ def run(args):
 
         g = gt_vpe(tracker, image, gt) if (gt is not None and not args.no_gt_probe) else None
         mem = memory_views(tracker)
-        rows.append(dict(frame=idx, iou=iou(pred, gt),
+        rows.append(dict(frame=idx, iou=iou(pred, gt), phase=phase_of(tracker),
                          **{k: cos(mem[k], g) for k, _ in TRACKS}))
 
     if not rows:
@@ -203,6 +237,7 @@ def run(args):
 
     frames = np.array([r['frame'] for r in rows])
     ious = np.array([r['iou'] for r in rows], dtype=float)
+    phases = np.array([r['phase'] for r in rows], dtype=int)
     curves = {k: np.array([r[k] for r in rows], dtype=float) for k, _ in TRACKS}
     absent = load_flags(video_path, 'full_occlusion.txt', n) | \
         load_flags(video_path, 'out_of_view.txt', n)
@@ -210,7 +245,7 @@ def run(args):
     if args.csv:
         out_csv = Path(args.csv)
         out_csv.parent.mkdir(parents=True, exist_ok=True)
-        cols = ['frame', 'iou'] + [k for k, _ in TRACKS]
+        cols = ['frame', 'iou', 'phase'] + [k for k, _ in TRACKS]
         lines = [','.join(cols)]
         lines += [','.join(f'{r[c]:.6f}' if isinstance(r[c], float) else str(r[c])
                            for c in cols) for r in rows]
@@ -227,13 +262,27 @@ def run(args):
         print(f'{k:<8}{np.nanmean(c):>10.3f}{np.nanmin(c):>10.3f}'
               f'{last:>10.3f}{last - first:>+15.3f}')
     print(f'\nсередній IoU: {np.nanmean(ious):.3f}')
+    for p in (2, 3):
+        share = float((phases == p).mean())
+        entries = sum(1 for _, _, v in runs(list(phases)) if v == p)
+        print(f'{PHASES[p][0]:<22}{share:6.1%} кадрів, входів: {entries}')
 
-    plot(args, name, frames, curves, ious, absent)
+    # Перетин «що трекер думає» × «що є насправді». Phase 1 при IoU<0.1 —
+    # сліпий лок: трекер упевнено веде ЧУЖИЙ об'єкт і не шукає ціль.
+    states = np.array([gt_state(i) for i in ious])
+    blind = (phases == 1) & (states == LOST)
+    n_lost = int((states == LOST).sum())
+    if n_lost:
+        print(f'сліпий лок: {blind.sum()}/{n_lost} кадрів поза ціллю трекер веде у Phase 1 '
+              f'({blind.sum() / n_lost:.0%})')
+
+    plot(args, name, frames, curves, ious, absent, phases, states, blind)
 
 
-def plot(args, name, frames, curves, ious, absent):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6), sharex=True,
-                                   gridspec_kw=dict(height_ratios=[2.2, 1], hspace=0.12))
+def plot(args, name, frames, curves, ious, absent, phases, states, blind):
+    fig, (ax1, ax2, ax3, ax4) = plt.subplots(
+        4, 1, figsize=(11, 7.0), sharex=True,
+        gridspec_kw=dict(height_ratios=[2.2, 1, 0.16, 0.16], hspace=0.12))
 
     for k, color in TRACKS:
         c = curves[k]
@@ -251,7 +300,6 @@ def plot(args, name, frames, curves, ious, absent):
     ax2.fill_between(frames, 0, ious, color=INK2, alpha=0.12, zorder=2)
     ax2.axhline(0.5, color=RED, lw=0.8, ls='--', alpha=0.6, zorder=1)
     ax2.set_ylabel('IoU трекера')
-    ax2.set_xlabel('кадр')
     ax2.set_ylim(0, 1)
     ax2.grid(True, color=GRID, lw=0.6, zorder=0)
 
@@ -261,6 +309,48 @@ def plot(args, name, frames, curves, ious, absent):
         for s, e in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
             for ax in (ax1, ax2):
                 ax.axvspan(s, e, color=MUTED, alpha=0.10, lw=0, zorder=1)
+
+    def bounds(i, j):
+        """Межі суміжної ділянки у координатах кадрів (роздільність = --stride)."""
+        lo = frames[i] if i == 0 else (frames[i - 1] + frames[i]) / 2
+        hi = frames[j] if j == len(frames) - 1 else (frames[j] + frames[j + 1]) / 2
+        return lo, hi
+
+    def ribbon(ax, values, palette, label):
+        for i, j, v in runs(list(values)):
+            lo, hi = bounds(i, j)
+            ax.axvspan(lo, hi, color=palette[v][1], lw=0,
+                       alpha=0.55 if v in (1, ON) else 0.95)
+        ax.set_yticks([])
+        ax.set_ylabel(label, rotation=0, ha='right', va='center', labelpad=8)
+        for side in ('left', 'bottom'):
+            ax.spines[side].set_visible(False)
+
+    # Дві стрічки одна під одною: що трекер ДУМАЄ vs що є НАСПРАВДІ.
+    # Розбіжність читається вертикально: сіре зверху + червоне знизу = сліпий лок.
+    ribbon(ax3, phases, PHASES, 'фаза')
+    ribbon(ax4, states, GT_STATES, 'GT')
+    ax4.set_xlabel('кадр')
+
+    # сліпий лок — підсвітити на панелі IoU, це головна патологія
+    for i, j, v in runs(list(blind)):
+        if v:
+            lo, hi = bounds(i, j)
+            ax2.axvspan(lo, hi, color=ROSE, alpha=0.16, lw=0, zorder=1)
+
+    # вертикальні риски входу у фази 2/3
+    for i, j, p in runs(list(phases)):
+        if p in (2, 3) and i > 0:
+            lo, _ = bounds(i, j)
+            for ax in (ax1, ax2):
+                ax.axvline(lo, color=PHASES[p][1], lw=0.7, alpha=0.5, zorder=1)
+
+    keys = ([(PHASES, p) for p in (1, 2, 3) if (phases == p).any()]
+            + [(GT_STATES, s) for s in (ON, DRIFT, LOST, UNK) if (states == s).any()])
+    ax4.legend([plt.Rectangle((0, 0), 1, 1, color=pal[v][1],
+                              alpha=0.55 if v in (1, ON) else 0.95) for pal, v in keys],
+               [pal[v][0] for pal, v in keys], frameon=False, fontsize=8,
+               ncol=4, loc='upper left', bbox_to_anchor=(0, -1.2))
 
     out = Path(args.out or f'figures/vpe_drift_{name}.png')
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -110,6 +110,53 @@ def main():
         print(f'   anchor > agg: {n_anchor_beats_agg}/{len(sub)} відео '
               f'← якщо 0, підняття anchor-ваги не має механізму допомогти')
 
+    # --- Чи ЗНАЄ трекер, що загубив ціль?
+    # Фази Phase 2/3 — єдині, де вмикається вся re-detection машинерія. Якщо
+    # загублені кадри проходять у Phase 1, трекер вважає себе здоровим на
+    # дистракторі, і жоден re-detect механізм не має шансу спрацювати.
+    if 'phase' in pd.read_csv(Path(args.csv_dir) / f'{rows[0]["video"]}.csv').columns:
+        print(f'\n=== СЛІПИЙ ЛОК: розподіл фаз на кадрах, де ціль ЗАГУБЛЕНА (IoU<0.1)')
+        print(f'{"відео":<16}{"half":<8}{"кадрів":>8}{"Phase 1":>9}{"Phase 2":>9}{"Phase 3":>9}')
+        tot = {1: 0, 2: 0, 3: 0}
+        for video, half in read_list(Path(args.list)):
+            f = Path(args.csv_dir) / f'{video}.csv'
+            if not f.exists():
+                continue
+            lost = pd.read_csv(f).query('iou < 0.1')
+            if len(lost) < MIN_FRAMES:
+                continue
+            sh = {p: (lost.phase == p).mean() for p in (1, 2, 3)}
+            for p in (1, 2, 3):
+                tot[p] += int((lost.phase == p).sum())
+            print(f'{video:<16}{half:<8}{len(lost):>8}'
+                  + ''.join(f'{sh[p]:>8.0%} ' for p in (1, 2, 3)))
+        n = sum(tot.values())
+        if n:
+            print(f'{"РАЗОМ":<24}{n:>8}' + ''.join(f'{tot[p] / n:>8.0%} ' for p in (1, 2, 3)))
+            print(f'   → {tot[1] / n:.0%} загублених кадрів трекер вважає нормальним треком')
+
+        # ⚠️ Phase 3 не може з'явитися в таблиці вище за побудовою: у Phase 3 трекер
+        # не повертає боксу, тож IoU=nan і кадр не потрапляє в «IoU<0.1». Рахуємо
+        # окремо, інакше «Phase 3 = 0%» читається як «ре-ID не працює».
+        allf = {1: 0, 2: 0, 3: 0}
+        nan_ph = {1: 0, 2: 0, 3: 0}
+        for video, _ in read_list(Path(args.list)):
+            f = Path(args.csv_dir) / f'{video}.csv'
+            if not f.exists():
+                continue
+            cur = pd.read_csv(f)   # НЕ `d` — зовнішній d тримає зведення по відео
+            for p in (1, 2, 3):
+                allf[p] += int((cur.phase == p).sum())
+                nan_ph[p] += int(((cur.phase == p) & cur.iou.isna()).sum())
+        m = sum(allf.values())
+        print(f'\n   Для контексту — усі {m} кадрів: '
+              + ', '.join(f'Phase {p} {allf[p] / m:.1%}' for p in (1, 2, 3)))
+        print(f'   З них БЕЗ боксу (IoU=nan): '
+              + ', '.join(f'Phase {p} {nan_ph[p]}/{allf[p]}' for p in (1, 2, 3)))
+        print('   → Phase 3 ⟺ детекцій нема взагалі. Стану «бокс є, але це ЧУЖИЙ '
+              'об\'єкт» у трекері не існує — тому ре-ID недосяжна саме тоді, коли\n'
+              '     дистрактор перехопив трек.')
+
     # --- Фігура: anchor − ST на відео, згруповані за половиною probe16
     # sharey=False: панелі містять різні набори відео й сортуються незалежно,
     # тож спільна вісь Y підписала б бари чужими іменами.
