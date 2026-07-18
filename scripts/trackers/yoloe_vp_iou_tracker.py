@@ -280,6 +280,118 @@ class KalmanBoxTracker:
         return float(intersection / (union + 1e-6))
 
 
+class CoexistExclusion:
+    """Виключення кандидатів re-detection за співіснуванням.
+
+    Об'єкт, який довго існує ОДНОЧАСНО з ціллю у роз'єднаній позиції, доведено не
+    є ціллю — його бокс неприйнятний для реідентифікації. Єдиний механізм, що не
+    порівнює зовнішність, тож не успадковує стелю «вигляд не розрізняє екземпляри».
+
+    Шар tracklet-ів навмисно найдешевший: асоціація ТІЛЬКИ за IoU, без Kalman
+    (фальсифіковано у 4 ролях) і без зовнішності. Його роль — лише встановити факт
+    «це той самий об'єкт, що й раніше».
+
+    stamp_min_frames критичний: за одного кадру роз'єднаності одна помилка
+    асоціації дає вічний хибний штамп (вимір: sepia-13 — штамп на кадрі 1 отруїв
+    2116 з 2713 кадрів, викресливши справжню ціль). Вимога накопиченого доказу
+    прибирає це (податок 0.000 на 15/16 probe16). 30 узято із запасу book-19
+    (962 з 991 кадрів роз'єднано), НЕ свіпом.
+    """
+
+    class _Tracklet:
+        __slots__ = ('id', 'box', 'misses', 'disjoint', 'stamped')
+
+        def __init__(self, tid, box):
+            self.id, self.box, self.misses = tid, box, 0
+            self.disjoint, self.stamped = 0, False
+
+    def __init__(self, link_thr: float = 0.1, max_age: int = 30,
+                 stamp_min_frames: int = 30):
+        self.link_thr = link_thr
+        self.max_age = max_age
+        self.stamp_min_frames = stamp_min_frames
+        self.tracks = []
+        self._by_id = {}
+        self._next_id = 0
+
+    @staticmethod
+    def _iou(a, b) -> float:
+        if a is None or b is None:
+            return 0.0
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return float(inter / ua) if ua > 0 else 0.0
+
+    def step(self, dets, ref_box):
+        """dets — список боксів xyxy поточного кадру; ref_box — бокс, який трекер
+        ТРИМАВ на минулому кадрі (None, якщо був загублений).
+
+        ref_box=None → не штампуємо: факт співіснування не встановлено. Саме тому
+        діра у видимості цілі не псує вже накопичений доказ проти дистрактора.
+
+        Повертає set індексів детекцій, що доведено НЕ є ціллю.
+        """
+        owner = self._associate(dets)
+        if ref_box is not None:
+            self._stamp(owner, dets, ref_box)
+        return {di for tid, di in owner.items()
+                if self._by_id[tid].stamped}
+
+    def _associate(self, dets):
+        pairs = []
+        for ti, t in enumerate(self.tracks):
+            for di, d in enumerate(dets):
+                v = self._iou(t.box, d)
+                if v >= self.link_thr:
+                    pairs.append((v, ti, di))
+        pairs.sort(key=lambda p: -p[0])
+
+        used_t, used_d, owner = set(), set(), {}
+        for _, ti, di in pairs:
+            if ti in used_t or di in used_d:
+                continue
+            used_t.add(ti)
+            used_d.add(di)
+            self.tracks[ti].box = dets[di]
+            self.tracks[ti].misses = 0
+            owner[self.tracks[ti].id] = di
+
+        for ti, t in enumerate(self.tracks):
+            if ti not in used_t:
+                t.misses += 1
+        self.tracks = [t for t in self.tracks if t.misses <= self.max_age]
+
+        for di, d in enumerate(dets):
+            if di not in used_d:
+                t = self._Tracklet(self._next_id, d)
+                self._next_id += 1
+                self.tracks.append(t)
+                owner[t.id] = di
+        self._by_id = {t.id: t for t in self.tracks}
+        return {tid: di for tid, di in owner.items() if tid in self._by_id}
+
+    def _stamp(self, owner, dets, ref_box):
+        # tracklet самої цілі — той, що володіє боксом трекера
+        own, best = None, 0.5
+        for tid, di in owner.items():
+            v = self._iou(dets[di], ref_box)
+            if v > best:
+                best, own = v, tid
+        for tid, di in owner.items():
+            t = self._by_id[tid]
+            if tid == own:          # це ціль — доказ «не ціль» спростовано
+                t.disjoint, t.stamped = 0, False
+                continue
+            if t.stamped:
+                continue
+            if self._iou(dets[di], ref_box) <= 0.0:   # роз'єднано — кадр доказу
+                t.disjoint += 1
+                if t.disjoint >= self.stamp_min_frames:
+                    t.stamped = True
+
+
 @register_tracker
 class YOLOeVPIoUTracker(BaseTracker):
     """
@@ -413,6 +525,18 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.conf = conf
         self.conf_max = conf_max
         self.conf_adaptive_rate = conf_adaptive_rate
+        # ⭐ Гейтований conf-floor: коли ціль ЗАГУБЛЕНА (Phase 2/3), знизити поріг
+        # детекції до conf_lost, щоб виловити слабку ціль, яку детектор бачить, але
+        # звичайний floor відкидає (drone-7 +0.121, surfboard-12 +0.099). Під час
+        # ЗДОРОВОГО ведення floor лишається високим — інакше низький поріг впускає
+        # дистрактори в трек (cattle-2 −0.562, sepia-13 −0.446). None = вимкнено.
+        self.conf_lost = kwargs.get('conf_lost', None)
+        # ⭐ Слабкий матч = «умовний»: детекція, підібрана під час втрати з conf нижче
+        # здорового floor, віддається як bbox, але НЕ вважається одужанням — лічильник
+        # lost і last_valid_bbox лишаються з докризового стану. Інакше два блимаючі
+        # слабкі матчі скидають лічильник, зсувають вхід у Фазу 3 і псують опорну
+        # рамку DIoU для ре-детекції (cattle-2: re-lock на 781 замість 774 → дистрактор).
+        self.conf_lost_tentative = kwargs.get('conf_lost_tentative', False)
         self.imgsz = imgsz
         self.device = device
         self.iou_threshold = iou_threshold
@@ -426,6 +550,15 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.warmup_vpe_iou_threshold = warmup_vpe_iou_threshold
         self.phase2_diou_threshold = phase2_diou_threshold
         self.phase2_switch_validation_frames = kwargs.get('phase2_switch_validation_frames', 0)
+        # ⭐ Міст pending-кандидата (експеримент): блимання детекцій рве серію валідації
+        # Фази 2 — на кадрі, де кандидат зник із детекцій, pending скидається, тож
+        # низько-conf ціль, що детектиться через кадр, ніколи не докомічується (гине в
+        # Фазі 3). Міст дозволяє pending пережити до phase2_pending_max_gap кадрів
+        # відсутності, не скидаючи лічильник. use_tracklet прив'язує ідентичність
+        # pending до coexist-tracklet id (стійкіше до зсуву, ніж bbox-IoU).
+        self.phase2_pending_bridge = kwargs.get('phase2_pending_bridge', False)
+        self.phase2_pending_max_gap = kwargs.get('phase2_pending_max_gap', 5)
+        self.phase2_pending_use_tracklet = kwargs.get('phase2_pending_use_tracklet', False)
         self.waiting_reinit_conf_threshold = waiting_reinit_conf_threshold
         self.waiting_reinit_diou_threshold = waiting_reinit_diou_threshold
         self.reinit_diou_threshold = reinit_diou_threshold
@@ -556,6 +689,15 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.joint_apply_phase2 = kwargs.get('joint_apply_phase2', False)
 
         # Phase 1 High Confidence Re-ID
+        # ⭐ Виключення за співіснуванням (див. CoexistExclusion). Застосовується лише
+        # у Фазах 2/3 — там, де трекер (пере)захоплює бокс після втрати. Фаза 1 (плавне
+        # сповзання) свідомо не чіпається: діагностика не моделювала поведінку трекера
+        # під вето на гарячому шляху здорового трекінгу.
+        self.use_coexist_exclusion = kwargs.get('use_coexist_exclusion', False)
+        self.coexist_link_thr = kwargs.get('coexist_link_thr', 0.1)
+        self.coexist_max_age = kwargs.get('coexist_max_age', 30)
+        self.coexist_stamp_min_frames = kwargs.get('coexist_stamp_min_frames', 30)
+
         self.phase1_high_conf_reid_threshold = kwargs.get('phase1_high_conf_reid_threshold', 0.9)
         self.phase1_high_conf_reid_iou = kwargs.get('phase1_high_conf_reid_iou', 0.3)
         self.phase1_high_conf_reid_diou = kwargs.get('phase1_high_conf_reid_diou', None)  # якщо задано — використовує DIoU замість IoU
@@ -681,6 +823,11 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.phase3_vpe_freeze_counter = 0  # Кількість кадрів що залишилось блокувати VPE
 
         # Phase 1 High Confidence Re-ID Validation
+        self.coexist = (CoexistExclusion(self.coexist_link_thr, self.coexist_max_age,
+                                         self.coexist_stamp_min_frames)
+                        if self.use_coexist_exclusion else None)
+        self._coexist_vetoed = set()  # індекси детекцій цього кадру, доведено «не ціль»
+
         self.phase1_high_conf_reid_candidate = None  # Кандидат для high-conf re-ID (dict з bbox, conf, iou)
         self.phase1_high_conf_reid_validation_count = 0  # Лічильник успішних перевірок
         self.phase1_high_conf_reid_skip_counter = 0    # Кадрів залишилось пропустити (0 = кадр перевірки)
@@ -688,6 +835,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Phase 2 Switch Validation
         self.phase2_pending_candidate = None  # Pending кандидат для перемикання в Phase 2 (dict з bbox, conf, diou)
         self.phase2_pending_validation_count = 0  # Лічильник кадрів очікування перед перемиканням
+        self.phase2_pending_gap = 0  # Кадрів відсутності pending-кандидата (для мосту)
+        self.phase2_pending_tid = None  # coexist-tracklet id, до якого прив'язано pending
 
         if self.verbose:
             # Conf adaptive info
@@ -1119,6 +1268,31 @@ class YOLOeVPIoUTracker(BaseTracker):
 
             boxes = results[0].boxes
 
+            # Діагностика (лише читається ззовні, на логіку не впливає): усі детекції
+            # кадру як [N,5] xyxy+conf — щоб аналіз міг спитати «чи ціль була серед
+            # кандидатів взагалі», не переганяючи детектор удруге.
+            try:
+                self.last_detections = np.concatenate(
+                    [boxes.xyxy.cpu().numpy(), boxes.conf.cpu().numpy()[:, None]], axis=1
+                ) if len(boxes) > 0 else np.zeros((0, 5), dtype=np.float32)
+            except Exception:
+                self.last_detections = np.zeros((0, 5), dtype=np.float32)
+
+            # ⭐ Виключення за співіснуванням: оновити tracklet-и і зібрати вето.
+            # Референс — бокс, який трекер тримав на МИНУЛОМУ кадрі: тут lost_frames і
+            # current_bbox ще не чіпані цим кадром, тож lost_frames>0 означає «минулого
+            # кадру боксу не було» → штампувати нема від чого. Рішення цього кадру бачить
+            # лише доказ, накопичений до нього.
+            if self.coexist is not None:
+                dets = [b for b in self.last_detections[:, :4].tolist()]
+                ref = self.current_bbox if self.lost_frames == 0 else None
+                self._coexist_vetoed = self.coexist.step(dets, ref)
+                if self.verbose and self._coexist_vetoed:
+                    print(f"   🚫 Співіснування: {len(self._coexist_vetoed)} з {len(dets)} "
+                          f"детекцій доведено «не ціль»")
+            else:
+                self._coexist_vetoed = set()
+
             # mask VPE crop: зберегти маски+боксы кадру для маскованого енкодингу VPE
             self._frame_masks_xy = None
             self._frame_boxes_xyxy = None
@@ -1376,8 +1550,21 @@ class YOLOeVPIoUTracker(BaseTracker):
                 else:
                     self.current_bbox = box_xyxy.tolist()
 
-                self.last_valid_bbox = self.current_bbox  # Оновити валідний bbox
-                self.lost_frames = 0  # Reset counter
+                # Умовний (слабкий) матч під час втрати: не рахувати одужанням
+                weak_match = (
+                    self.conf_lost_tentative
+                    and self.conf_lost is not None
+                    and self.lost_frames > 0
+                    and box_conf < self._get_healthy_conf()
+                )
+                if weak_match:
+                    self.lost_frames += 1
+                    if self.verbose:
+                        print(f"   ⏳ [PHASE 1] Умовний матч (conf={box_conf:.3f} < {self._get_healthy_conf():.3f}): "
+                              f"lost не скинуто ({self.lost_frames}/{self.max_lost_frames}), опорна рамка збережена")
+                else:
+                    self.last_valid_bbox = self.current_bbox  # Оновити валідний bbox
+                    self.lost_frames = 0  # Reset counter
                 self.last_bbox_is_kalman_only = False  # Детекція знайдена - bbox валідовано
 
                 # ⭐ Дистрактор-пам'ять: на здоровому кадрі всі НЕ-цільові детекції
@@ -1564,6 +1751,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                         lam_p2 = self._adaptive_lambda() if use_joint_p2 else None
                         best_p2_sel = -float('inf')
                         for idx, box in enumerate(boxes):
+                            if idx in self._coexist_vetoed:
+                                continue
                             box_xyxy = box.xyxy[0].cpu().numpy()
                             diou = self._compute_diou(self.last_valid_bbox, box_xyxy)
                             if diou < self.phase2_diou_threshold:
@@ -1600,13 +1789,22 @@ class YOLOeVPIoUTracker(BaseTracker):
                             # Перевірити чи це той самий кандидат що і раніше
                             is_same_candidate = False
                             if self.phase2_pending_candidate is not None:
-                                prev_bbox = self.phase2_pending_candidate['bbox']
-                                curr_bbox = current_candidate['bbox']
-                                candidate_iou = self._compute_iou(prev_bbox, curr_bbox)
-                                # Вважаємо що це той самий кандидат якщо IoU > 0.5
-                                is_same_candidate = candidate_iou > 0.5
+                                if (self.phase2_pending_bridge and self.phase2_pending_use_tracklet
+                                        and self.phase2_pending_tid is not None):
+                                    # Прив'язка за coexist-tracklet id — переживає зсув боксу,
+                                    # де bbox-IoU падає нижче 0.5.
+                                    is_same_candidate = (
+                                        self._tracklet_id_for(box_xyxy) == self.phase2_pending_tid)
+                                else:
+                                    prev_bbox = self.phase2_pending_candidate['bbox']
+                                    curr_bbox = current_candidate['bbox']
+                                    candidate_iou = self._compute_iou(prev_bbox, curr_bbox)
+                                    # Вважаємо що це той самий кандидат якщо IoU > 0.5
+                                    is_same_candidate = candidate_iou > 0.5
 
                             if is_same_candidate:
+                                # Кандидат знову видимий — міст закрито, скинути лічильник пропусків
+                                self.phase2_pending_gap = 0
                                 # Продовжити валідацію того самого кандидата
                                 self.phase2_pending_validation_count += 1
                                 if self.verbose:
@@ -1623,6 +1821,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                                 # Новий кандидат - почати валідацію спочатку
                                 self.phase2_pending_candidate = current_candidate
                                 self.phase2_pending_validation_count = 1
+                                self.phase2_pending_gap = 0
+                                self.phase2_pending_tid = self._tracklet_id_for(box_xyxy)
                                 if self.verbose:
                                     print(f"   🆕 [PHASE 2] Новий pending кандидат виявлено")
                                     print(f"      DIoU={current_candidate['diou']:.3f}, conf={current_candidate['conf']:.3f}")
@@ -1715,12 +1915,23 @@ class YOLOeVPIoUTracker(BaseTracker):
                             x1, y1, x2, y2 = self.current_bbox
                             return True, [x1, y1, x2 - x1, y2 - y1]
                     else:
-                        # Кандидат не знайдено або втрачено - скинути pending
+                        # Кандидат не знайдено цього кадру (блимання детекцій)
                         if self.phase2_pending_candidate is not None:
-                            if self.verbose:
-                                print(f"   ❌ [PHASE 2] Pending скинуто (кандидат втрачено)")
-                            self.phase2_pending_candidate = None
-                            self.phase2_pending_validation_count = 0
+                            if (self.phase2_pending_bridge
+                                    and self.phase2_pending_gap < self.phase2_pending_max_gap):
+                                # ⭐ МІСТ: пережити пропуск, не скидаючи серію валідації.
+                                self.phase2_pending_gap += 1
+                                if self.verbose:
+                                    print(f"   🌉 [PHASE 2] Міст pending: пропуск "
+                                          f"{self.phase2_pending_gap}/{self.phase2_pending_max_gap} "
+                                          f"(валідація {self.phase2_pending_validation_count} збережена)")
+                            else:
+                                if self.verbose:
+                                    print(f"   ❌ [PHASE 2] Pending скинуто (кандидат втрачено)")
+                                self.phase2_pending_candidate = None
+                                self.phase2_pending_validation_count = 0
+                                self.phase2_pending_gap = 0
+                                self.phase2_pending_tid = None
 
                     # Перевірити чи є детекція з високою conf та прийнятним DIoU для дострокової реініціалізації
                     waiting_reinit_idx = -1
@@ -1963,6 +2174,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                         diou_floor = self._current_diou_floor(boxes)
                         joint_eligible = []
                         for idx, box in enumerate(boxes):
+                            if idx in self._coexist_vetoed:
+                                continue
                             box_xyxy = box.xyxy[0].cpu().numpy()
                             box_conf = float(box.conf[0].cpu().numpy())
                             diou = self._compute_diou(phase3_ref_bbox, box_xyxy)
@@ -2021,6 +2234,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                     if self.reinit_conf_threshold < 1.0:
                         high_conf_eligible = []
                         for idx, box in enumerate(boxes):
+                            if idx in self._coexist_vetoed:
+                                continue
                             box_conf = float(box.conf[0].cpu().numpy())
                             if box_conf >= self.reinit_conf_threshold:
                                 box_xyxy_temp = box.xyxy[0].cpu().numpy()
@@ -2086,6 +2301,8 @@ class YOLOeVPIoUTracker(BaseTracker):
                         reinit_eligible = []  # Кандидати, що пройшли DIoU-гейт
 
                         for idx, box in enumerate(boxes):
+                            if idx in self._coexist_vetoed:
+                                continue
                             box_xyxy = box.xyxy[0].cpu().numpy()
                             box_conf = float(box.conf[0].cpu().numpy())
 
@@ -2175,16 +2392,28 @@ class YOLOeVPIoUTracker(BaseTracker):
 
                     else:
                         # Немає обмеження на DIoU — max(conf) або appearance-зважений вибір
+                        # best_conf_idx приходить зі спільного циклу кандидатів (він же
+                        # годує Фазу 1, тож вето там не ставиться) — фільтруємо тут.
+                        if best_conf_idx in self._coexist_vetoed:
+                            best_conf_idx, best_conf_v = -1, -1.0
+                            for idx, box in enumerate(boxes):
+                                if idx in self._coexist_vetoed:
+                                    continue
+                                c = float(box.conf[0].cpu().numpy())
+                                if c > best_conf_v:
+                                    best_conf_v, best_conf_idx = c, idx
                         if best_conf_idx >= 0 and self.phase3_appearance_weight > 0.0:
                             fallback_eligible = [
                                 {'idx': idx,
                                  'conf': float(box.conf[0].cpu().numpy()),
                                  'xyxy': box.xyxy[0].cpu().numpy()}
                                 for idx, box in enumerate(boxes)
+                                if idx not in self._coexist_vetoed
                             ]
-                            chosen = self._select_phase3_candidate(image, fallback_eligible,
-                                                                   tag="max-conf")
-                            best_conf_idx = chosen['idx']
+                            if fallback_eligible:
+                                chosen = self._select_phase3_candidate(image, fallback_eligible,
+                                                                       tag="max-conf")
+                                best_conf_idx = chosen['idx']
                         if best_conf_idx >= 0:
                             best_box = boxes[best_conf_idx]
                             box_xyxy = best_box.xyxy[0].cpu().numpy()
@@ -2367,6 +2596,20 @@ class YOLOeVPIoUTracker(BaseTracker):
             if self.verbose:
                 print(f"   ⚠️  Phase 3 batch VPE error: {e}")
             return None
+
+    def _tracklet_id_for(self, bbox_xyxy) -> Optional[int]:
+        """coexist-tracklet id, що володіє даним боксом цього кадру (для мосту pending).
+        None, якщо пул вимкнено або збігу нема."""
+        if self.coexist is None:
+            return None
+        best, tid = 0.3, None
+        for t in self.coexist.tracks:
+            if t.misses != 0:
+                continue
+            v = CoexistExclusion._iou(t.box, bbox_xyxy)
+            if v > best:
+                best, tid = v, t.id
+        return tid
 
     def _select_phase3_candidate(self, image: np.ndarray, eligible: List[Dict], tag: str = "") -> Dict:
         """Вибір кандидата реініціалізації серед eligible=[{idx, conf, xyxy, ...}].
@@ -2776,6 +3019,15 @@ class YOLOeVPIoUTracker(BaseTracker):
         Returns:
             float - поточний conf threshold
         """
+        # ⭐ Гейт за станом втрати: коли ціль загублена — низький floor для пошуку
+        # слабкої цілі; на цілі — звичайна (строга) логіка, щоб не впускати дистрактори.
+        if self.conf_lost is not None and self.lost_frames > 0:
+            return self.conf_lost
+
+        return self._get_healthy_conf()
+
+    def _get_healthy_conf(self) -> float:
+        """Адаптивний conf floor БЕЗ гейта втрати (поріг «здорового» ведення)."""
         # Якщо адаптація вимкнена (max <= threshold, тобто не більш строге)
         if self.conf_max <= self.conf:
             return self.conf
@@ -3001,6 +3253,8 @@ class YOLOeVPIoUTracker(BaseTracker):
         self.phase1_high_conf_reid_validation_count = 0
         self.phase2_pending_candidate = None
         self.phase2_pending_validation_count = 0
+        self.phase2_pending_gap = 0
+        self.phase2_pending_tid = None
         self.phase3_vpe_freeze_counter = 0
         self.phase3_validation_failure_count = 0
         self.in_phase3_validation = False
@@ -3042,6 +3296,18 @@ class YOLOeVPIoUTracker(BaseTracker):
         # Кандидати multi-VPE з видом пам'яті (anchor/LT/ST), якщо режим активний
         if self.multi_vpe_candidates:
             info['multi_vpe_candidates'] = self.multi_vpe_candidates
+
+        # Пул tracklet-ів виключення за співіснуванням (для --visualize):
+        # id, бокс, стан штампа, лічильник роз'єднаного доказу, факт вето цього кадру.
+        if self.coexist is not None:
+            info['coexist_tracklets'] = [
+                {'id': t.id,
+                 'bbox': [t.box[0], t.box[1], t.box[2] - t.box[0], t.box[3] - t.box[1]],
+                 'stamped': t.stamped,
+                 'disjoint': t.disjoint,
+                 'present': (t.misses == 0)}
+                for t in self.coexist.tracks if t.misses == 0
+            ]
 
         # Флаг: чи є поточний bbox тільки від Калмана (не валідовано детекціями)
         info['last_bbox_is_kalman_only'] = self.last_bbox_is_kalman_only
