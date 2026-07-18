@@ -161,9 +161,11 @@ def cos(a, b) -> float:
     return float(torch.dot(a, b))
 
 
-def gt_vpe(tracker, image, gt_xywh):
-    """Закодувати VPE з GT-боксу, не торкаючись пам'яті трекера."""
-    x, y, w, h = gt_xywh
+def box_vpe(tracker, image, xywh):
+    """Закодувати VPE з довільного боксу [x,y,w,h], не торкаючись пам'яті трекера."""
+    if xywh is None:
+        return None
+    x, y, w, h = xywh
     if w <= 1 or h <= 1:
         return None
     try:
@@ -172,7 +174,7 @@ def gt_vpe(tracker, image, gt_xywh):
                             cls=np.array([0])))
         return flat_unit(vp.get_vpe(image))
     except Exception as e:
-        print(f'   ⚠️  gt_vpe: {e}')
+        print(f'   ⚠️  box_vpe: {e}')
         return None
 
 
@@ -227,10 +229,20 @@ def run(args):
         if idx % args.stride:
             continue
 
-        g = gt_vpe(tracker, image, gt) if (gt is not None and not args.no_gt_probe) else None
+        g = box_vpe(tracker, image, gt) if (gt is not None and not args.no_gt_probe) else None
         mem = memory_views(tracker)
-        rows.append(dict(frame=idx, iou=iou(pred, gt), phase=phase_of(tracker),
-                         **{k: cos(mem[k], g) for k, _ in TRACKS}))
+        row = dict(frame=idx, iou=iou(pred, gt), phase=phase_of(tracker),
+                   **{k: cos(mem[k], g) for k, _ in TRACKS})
+        # бокс трекера — щоб рахувати IoU між сусідніми кадрами (те, з чим
+        # порівнюється iou_threshold на Phase-1 матчі)
+        row.update(dict(zip(('px', 'py', 'pw', 'ph'),
+                            pred if pred is not None else (np.nan,) * 4)))
+        # cos(пам'ять, VPE ТОГО боксу, який тримає трекер) — саме цю величину
+        # міг би бачити identity-гейт у реальному часі (GT він не має).
+        if not args.no_gt_probe:
+            p = box_vpe(tracker, image, pred)
+            row.update({f'pred_{k}': cos(mem[k], p) for k, _ in TRACKS})
+        rows.append(row)
 
     if not rows:
         raise SystemExit('❌ Жодного кадру не оброблено')
@@ -245,7 +257,9 @@ def run(args):
     if args.csv:
         out_csv = Path(args.csv)
         out_csv.parent.mkdir(parents=True, exist_ok=True)
-        cols = ['frame', 'iou', 'phase'] + [k for k, _ in TRACKS]
+        cols = (['frame', 'iou', 'phase'] + [k for k, _ in TRACKS]
+                + [c for c in (f'pred_{k}' for k, _ in TRACKS) if c in rows[0]]
+                + ['px', 'py', 'pw', 'ph'])
         lines = [','.join(cols)]
         lines += [','.join(f'{r[c]:.6f}' if isinstance(r[c], float) else str(r[c])
                            for c in cols) for r in rows]

@@ -929,6 +929,33 @@ class ModularEvaluator:
                 cv2.putText(image, v, (lx + 20, yy),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
 
+        # ⭐ Пул tracklet-ів виключення за співіснуванням (прапорець coexist_draw_ids):
+        # блакитний = живий кандидат, червоний = проштампований «не ціль» (вето на
+        # re-detection). Число в дужках — лічильник роз'єднаного доказу до порога 30.
+        if (tracking_info and tracking_info.get('coexist_tracklets')
+                and self.tracker_params.get('coexist_draw_ids', False)):
+            for t in tracking_info['coexist_tracklets']:
+                x, y, w, h = [int(v) for v in t['bbox']]
+                stamped = t['stamped']
+                color = (60, 60, 230) if stamped else (230, 180, 40)  # BGR: черв / блакит
+                cv2.rectangle(image, (x, y), (x + w, y + h), color, 2 if stamped else 1)
+                tag = f"#{t['id']}"
+                if stamped:
+                    tag += " NIET"
+                elif t['disjoint'] > 0:
+                    tag += f" ({t['disjoint']}/30)"
+                cv2.putText(image, tag, (x, y + h + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+            lx, ly = 10, image.shape[0] - 10
+            cv2.putText(image, "coexist:", (lx, ly - 2 * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            for i, (lbl, c) in enumerate([("live", (230, 180, 40)),
+                                          ("NIET (vetoed)", (60, 60, 230))]):
+                yy = ly - (1 - i) * 18
+                cv2.rectangle(image, (lx, yy - 10), (lx + 14, yy), c, -1)
+                cv2.putText(image, lbl, (lx + 20, yy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+
         cv2.imwrite(str(output_path), image)
 
     @staticmethod

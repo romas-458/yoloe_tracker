@@ -177,3 +177,6 @@ run.txt
 # Downloaded model assets (large, regenerable)
 *.ts
 mobileclip_*.ts
+
+# LibreOffice lock files
+.~lock.*#
