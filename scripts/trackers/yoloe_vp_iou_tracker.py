@@ -3226,6 +3226,14 @@ class YOLOeVPIoUTracker(BaseTracker):
             if self.verbose:
                 print(f"   ⚠️  Помилка при обчисленні proximity детекцій: {e}")
             return []
+        finally:
+            # VP-предикт вище переналаштовує nc/names моделі (як і у фолбек-гілці
+            # update) — без цього наступний set_classes() падає на
+            # names.values() і VPE більше ніколи не застосовується
+            self._applied_vpe_version = None
+            names = getattr(self.model.model, 'names', None)
+            if not isinstance(names, dict):
+                self.model.model.names = {i: str(n) for i, n in enumerate(names or ['object0'])}
 
     def _get_proximity_info(self) -> Optional[Dict[str, Any]]:
         """
